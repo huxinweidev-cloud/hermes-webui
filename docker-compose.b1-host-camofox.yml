@@ -1,0 +1,71 @@
+# Hardened local deployment for hxwhub Hermes WebUI.
+#
+# This compose file is intentionally separate from upstream docker-compose.yml.
+# It reuses the host Hermes Agent state/runtime via bind mounts and routes
+# browser automation to the existing camofox-browser container on the internal
+# Docker network. Do not mount Docker socket, SSH keys, gh config, or the whole
+# host home directory.
+
+services:
+  hermes-webui-nesquena:
+    container_name: hermes-webui-nesquena
+    image: hermes-webui-nesquena:b1-host-camofox
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        HERMES_VERSION: v0.51.134-b1-host-camofox
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8787:8787"
+    networks:
+      - sub2api-network
+    volumes:
+      # Existing Hermes Agent home: config, profiles, skills, sessions, memory,
+      # auth, and the local hermes-agent checkout. This must be writable because
+      # WebUI/Hermes writes sessions, memory, skills, and profile state.
+      - /home/ubuntu/.hermes:/home/hermeswebui/.hermes:rw
+      # Host uv-managed Python runtime used by the mounted Hermes venv symlinks.
+      - /home/ubuntu/.local/share/uv:/home/ubuntu/.local/share/uv:ro
+      # Optional convenience wrapper; kept read-only.
+      - /home/ubuntu/.local/bin/hermes:/home/ubuntu/.local/bin/hermes:ro
+      # Explicit least-privilege workspace. Add more project mounts only when needed.
+      - /opt/hermes-webui-nesquena/workspace:/workspace:rw
+    env_file:
+      - .env.b1-host-camofox
+    environment:
+      WANTED_UID: "1001"
+      WANTED_GID: "1001"
+      HOME: /home/hermeswebui
+      HERMES_HOME: /home/hermeswebui/.hermes
+      HERMES_WEBUI_AGENT_DIR: /home/hermeswebui/.hermes/hermes-agent
+      HERMES_WEBUI_PYTHON: /home/hermeswebui/.hermes/hermes-agent/venv/bin/python
+      HERMES_WEBUI_HOST: 0.0.0.0
+      HERMES_WEBUI_PORT: "8787"
+      HERMES_WEBUI_STATE_DIR: /home/hermeswebui/.hermes/webui
+      HERMES_WEBUI_DEFAULT_WORKSPACE: /workspace
+      HERMES_SKIP_CHMOD: "1"
+      HERMES_WEBUI_SKIP_AGENT_DEPS_INSTALL: "0"
+      HERMES_WEBUI_AUTO_INSTALL: "0"
+      PYTHONPATH: /home/hermeswebui/.hermes/hermes-agent
+      HERMES_PYTHON_SRC_ROOT: /home/hermeswebui/.hermes/hermes-agent
+      HERMES_WEB_UI_GATEWAY_AUTOSTART: "0"
+      HERMES_BRIDGE_TOOLSETS: web,browser,terminal,file,skills,memory,session_search,todo,cronjob,delegation,vision
+      CAMOFOX_URL: http://camofox-browser:9377
+      CAMOFOX_ADOPT_EXISTING_TAB: "1"
+      PYTHONUNBUFFERED: "1"
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:size=512m,mode=1777
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8787/health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 60s
+      retries: 5
+
+networks:
+  sub2api-network:
+    external: true
+    name: sub2api_sub2api-network

@@ -378,11 +378,14 @@ else
   uv pip install -U pip setuptools --trusted-host pypi.org --trusted-host files.pythonhosted.org
   test -x /app/venv/bin/pip
 
-  echo ""; echo "== Adding hermes-agent's pyproject.toml base dependencies to the virtual environment"
-  _agent_paths=(
-    "/home/hermeswebui/.hermes/hermes-agent"
-    "/opt/hermes"
-  )
+  if [ "${HERMES_WEBUI_SKIP_AGENT_DEPS_INSTALL:-0}" = "1" ]; then
+    echo ""; echo "== Skipping hermes-agent dependency install (HERMES_WEBUI_SKIP_AGENT_DEPS_INSTALL=1)"
+  else
+    echo ""; echo "== Adding hermes-agent's pyproject.toml base dependencies to the virtual environment"
+    _agent_paths=(
+      "/home/hermeswebui/.hermes/hermes-agent"
+      "/opt/hermes"
+    )
   _agent_src=""
   for _p in "${_agent_paths[@]}"; do
     if [ -d "$_p" ] && [ -f "$_p/pyproject.toml" ]; then
@@ -421,6 +424,7 @@ else
       rsync -a \
         --exclude='*.egg-info' --exclude='build' --exclude='dist' \
         --exclude='__pycache__' --exclude='.git' \
+        --exclude='.venv' --exclude='venv' --exclude='node_modules' \
         "$_agent_src"/ "$_stage_src"/ \
         || error_exit "Failed to stage hermes-agent source to writable build dir"
     else
@@ -446,6 +450,7 @@ else
     echo "!! Or see the two-container compose example:"
     echo "!!   https://github.com/nesquena/hermes-webui/blob/master/docker-compose.two-container.yml"
     echo ""
+  fi
   fi
   touch /app/venv/.deps_installed
 fi
