@@ -2442,6 +2442,139 @@ def _keep_latest_messaging_session_per_source(
     return kept
 
 
+def _is_valid_session_resolve_profile(profile: str) -> bool:
+    if not profile:
+        return True
+    try:
+        from api.profiles import _PROFILE_ID_RE, _is_root_profile
+
+        return bool(_is_root_profile(profile) or _PROFILE_ID_RE.fullmatch(profile))
+    except Exception:
+        return bool(re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", profile))
+
+
+def _session_resolve_sort_key(row: dict) -> tuple:
+    segment_count = 0
+    for key in ("_compression_segment_count", "_lineage_collapsed_count"):
+        try:
+            segment_count = max(segment_count, int(row.get(key) or 0))
+        except (TypeError, ValueError):
+            pass
+    try:
+        timestamp = float(row.get("last_message_at") or row.get("updated_at") or row.get("created_at") or 0)
+    except (TypeError, ValueError):
+        timestamp = 0.0
+    return (segment_count, 0 if row.get("pre_compression_snapshot") else 1, timestamp)
+
+
+def _row_lineage_contains_session(row: dict, sid: str) -> bool:
+    if not sid:
+        return False
+    for seg in row.get("_lineage_segments") or []:
+        if isinstance(seg, dict) and str(seg.get("session_id") or seg.get("id") or "") == sid:
+            return True
+    return False
+
+
+def _handle_session_resolve(handler, parsed) -> bool:
+    query = parse_qs(parsed.query)
+    sid = str((query.get("session_id") or query.get("session") or [""])[0] or "").strip()
+    if not sid:
+        return bad(handler, "session_id is required", status=400)
+
+    from api.profiles import get_active_profile_name
+
+    requested_profile = str((query.get("profile") or [""])[0] or "").strip()
+    if requested_profile and not _is_valid_session_resolve_profile(requested_profile):
+        return bad(handler, "invalid_profile", status=400)
+    active_profile = requested_profile or get_active_profile_name() or "default"
+
+    rows = all_sessions()
+    scoped_rows = [row for row in rows if _profiles_match(row.get("profile"), active_profile)]
+    rows_by_id = {str(row.get("session_id") or ""): row for row in scoped_rows if row.get("session_id")}
+
+    def payload(canonical_sid, status, reason):
+        return {
+            "requested_session_id": sid,
+            "canonical_visible_session_id": canonical_sid,
+            "status": status,
+            "profile": active_profile,
+            "reason": reason,
+        }
+
+    requested_row = rows_by_id.get(sid)
+    if requested_row and not requested_row.get("pre_compression_snapshot"):
+        return j(handler, payload(sid, "visible", None))
+
+    candidates = []
+    for row in scoped_rows:
+        row_sid = str(row.get("session_id") or "")
+        if not row_sid or row.get("session_source") == "fork" or row.get("relationship_type") == "child_session":
+            continue
+        lineage_like = bool(
+            row.get("_lineage_key")
+            or row.get("_lineage_root_id")
+            or row.get("lineage_root_id")
+            or row.get("_compression_segment_count")
+            or row.get("pre_compression_snapshot")
+            or row.get("parent_session_id")
+            or row.get("_lineage_segments")
+        )
+        if not lineage_like:
+            continue
+        if (
+            row_sid == sid
+            or row.get("parent_session_id") == sid
+            or row.get("_lineage_root_id") == sid
+            or row.get("lineage_root_id") == sid
+            or row.get("_lineage_key") == sid
+            or _row_lineage_contains_session(row, sid)
+        ):
+            candidates.append(row)
+
+    if candidates:
+        candidates.sort(key=_session_resolve_sort_key, reverse=True)
+        canonical_sid = str(candidates[0].get("session_id") or "") or None
+        if canonical_sid and canonical_sid != sid:
+            return j(
+                handler,
+                payload(
+                    canonical_sid,
+                    "resolved_to_continuation",
+                    "requested session is a pre-compression snapshot with a visible continuation",
+                ),
+            )
+
+    if requested_row:
+        return j(handler, payload(sid, "visible", None))
+
+    report = read_session_lineage_report(_profile_state_db_path(active_profile), sid)
+    if report.get("found"):
+        return j(
+            handler,
+            payload(
+                None,
+                "state_db_only",
+                "session exists in profile state.db but no WebUI sidecar transcript is available",
+            ),
+        )
+
+    # If the id is visible in another profile, make that diagnosable without
+    # leaking full session content or silently falling back across profiles.
+    for row in rows:
+        if str(row.get("session_id") or "") == sid:
+            return j(
+                handler,
+                payload(
+                    None,
+                    "profile_mismatch",
+                    "session exists but is not visible in the requested profile",
+                ),
+            )
+
+    return bad(handler, "Session not found", status=404)
+
+
 from api.models import (
     Session,
     get_session,
@@ -2451,6 +2584,7 @@ from api.models import (
     _write_session_index,
     SESSION_INDEX_FILE,
     _active_state_db_path,
+    _profile_state_db_path,
     load_projects,
     save_projects,
     import_cli_session,
@@ -4274,6 +4408,9 @@ def handle_get(handler, parsed) -> bool:
                 sess = _merge_cli_sidebar_metadata(sess, cli_meta)
                 return j(handler, {"session": redact_session_data(sess)})
             return bad(handler, "Session not found", 404)
+
+    if parsed.path == "/api/session/resolve":
+        return _handle_session_resolve(handler, parsed)
 
     if parsed.path == "/api/session/lineage/report":
         sid = parse_qs(parsed.query).get("session_id", [""])[0]

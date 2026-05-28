@@ -2242,15 +2242,32 @@ def _sidebar_title_is_generic_webui(title: str | None) -> bool:
     return text.startswith(prefix) and text[len(prefix):].isdigit()
 
 
+def _profile_state_db_path(profile: str | None) -> Path:
+    """Return state.db for a specific Hermes profile without active-profile TLS."""
+    return _get_profile_home(profile or 'default').expanduser().resolve() / 'state.db'
+
+
 def _enrich_sidebar_lineage_metadata(sessions: list[dict]) -> None:
     """Attach state.db compression lineage metadata used by sidebar collapse."""
-    try:
-        metadata = read_session_lineage_metadata(
-            _active_state_db_path(),
-            {str(s.get('session_id')) for s in sessions if s.get('session_id')},
-        )
-    except Exception:
-        return
+    ids_by_profile: dict[str, set[str]] = {}
+    for session in sessions:
+        sid = str(session.get('session_id') or '')
+        if not sid:
+            continue
+        profile = str(session.get('profile') or 'default')
+        ids_by_profile.setdefault(profile, set()).add(sid)
+
+    metadata: dict[str, dict] = {}
+    for profile, session_ids in ids_by_profile.items():
+        try:
+            metadata.update(
+                read_session_lineage_metadata(
+                    _profile_state_db_path(profile),
+                    session_ids,
+                )
+            )
+        except Exception:
+            logger.debug("Failed to read sidebar lineage metadata for profile %s", profile)
     for session in sessions:
         sid = session.get('session_id')
         if sid in metadata:

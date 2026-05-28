@@ -92,6 +92,8 @@ def clean_env(monkeypatch):
         "HERMES_WEBUI_HOST",
         "HERMES_WEBUI_PORT",
         "HERMES_WEBUI_AGENT_DIR",
+        "HERMES_WEBUI_CAMOFOX_URL",
+        "CAMOFOX_URL",
     ):
         monkeypatch.delenv(name, raising=False)
 
@@ -417,6 +419,28 @@ class TestForegroundEnvAndCwd:
         # In foreground mode there's no parent left to retry from — the
         # supervisor's KeepAlive handles it. wait_for_health must not run.
         assert len(wait_calls) == 0
+
+
+class TestWebuiCamofoxDefault:
+    """WebUI-specific Camofox URL is a startup default for browser tools."""
+
+    def test_sets_camofox_url_from_webui_url_when_unset(self, import_bootstrap, clean_env, monkeypatch):
+        bs = import_bootstrap
+        monkeypatch.setenv("HERMES_WEBUI_CAMOFOX_URL", "http://camofox-browser:9377")
+        monkeypatch.delenv("CAMOFOX_URL", raising=False)
+
+        bs._apply_webui_camofox_default()
+
+        assert os.environ["CAMOFOX_URL"] == "http://camofox-browser:9377"
+
+    def test_does_not_override_explicit_camofox_url(self, import_bootstrap, clean_env, monkeypatch):
+        bs = import_bootstrap
+        monkeypatch.setenv("HERMES_WEBUI_CAMOFOX_URL", "http://camofox-browser:9377")
+        monkeypatch.setenv("CAMOFOX_URL", "http://127.0.0.1:9377")
+
+        bs._apply_webui_camofox_default()
+
+        assert os.environ["CAMOFOX_URL"] == "http://127.0.0.1:9377"
 
 
 class TestForegroundExecutabilityGuard:

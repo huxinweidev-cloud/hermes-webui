@@ -647,6 +647,11 @@ def get_profile_runtime_env(home: Path) -> dict[str, str]:
     environment variables (matching ``hermes -p <profile>``), so streaming must
     apply the selected profile's terminal config and ``.env`` for the duration
     of that run.
+
+    Containerized WebUI deployments may need a different Camofox endpoint than
+    host-side Hermes CLI/Gateway processes.  When HERMES_WEBUI_CAMOFOX_URL is
+    set, keep the single Hermes profile intact but force CAMOFOX_URL in this
+    per-turn runtime env as well as in process-wide dotenv reloads.
     """
     home = Path(home).expanduser()
     env: dict[str, str] = {}
@@ -680,6 +685,10 @@ def get_profile_runtime_env(home: Path) -> dict[str, str]:
                         env[k] = v
         except Exception:
             logger.debug("Failed to read runtime env from %s", env_path)
+
+    webui_camofox_url = os.environ.get("HERMES_WEBUI_CAMOFOX_URL", "").strip()
+    if webui_camofox_url:
+        env["CAMOFOX_URL"] = webui_camofox_url
 
     return env
 
@@ -803,6 +812,11 @@ def _reload_dotenv(home: Path):
     Clears env vars that were loaded from the previously active profile before
     applying the current profile's .env. This prevents API keys and other
     profile-scoped secrets from leaking across profile switches.
+
+    Containerized WebUI deployments may need a different Camofox endpoint than
+    host-side Hermes CLI/Gateway processes.  When HERMES_WEBUI_CAMOFOX_URL is
+    set, keep the single Hermes profile intact but force CAMOFOX_URL to the
+    WebUI-local endpoint after profile .env reloads.
     """
     global _loaded_profile_env_keys
 
@@ -812,23 +826,28 @@ def _reload_dotenv(home: Path):
     _loaded_profile_env_keys = set()
 
     env_path = home / '.env'
-    if not env_path.exists():
-        return
-    try:
-        loaded_keys: set[str] = set()
-        for line in env_path.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if line and not line.startswith('#') and '=' in line:
-                k, v = line.split('=', 1)
-                k = k.strip()
-                v = v.strip().strip('"').strip("'")
-                if k and v:
-                    os.environ[k] = v
-                    loaded_keys.add(k)
-        _loaded_profile_env_keys = loaded_keys
-    except Exception:
-        _loaded_profile_env_keys = set()
-        logger.debug("Failed to reload dotenv from %s", env_path)
+    loaded_keys: set[str] = set()
+    if env_path.exists():
+        try:
+            for line in env_path.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if line and not line.startswith('#') and '=' in line:
+                    k, v = line.split('=', 1)
+                    k = k.strip()
+                    v = v.strip().strip('"').strip("'")
+                    if k and v:
+                        os.environ[k] = v
+                        loaded_keys.add(k)
+        except Exception:
+            loaded_keys = set()
+            logger.debug("Failed to reload dotenv from %s", env_path)
+
+    webui_camofox_url = os.environ.get("HERMES_WEBUI_CAMOFOX_URL", "").strip()
+    if webui_camofox_url:
+        os.environ["CAMOFOX_URL"] = webui_camofox_url
+        loaded_keys.add("CAMOFOX_URL")
+
+    _loaded_profile_env_keys = loaded_keys
 
 
 def init_profile_state() -> None:

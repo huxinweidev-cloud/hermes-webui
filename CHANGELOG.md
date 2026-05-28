@@ -3,6 +3,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- WebUI-launched Hermes Agent browser tools now inherit `HERMES_WEBUI_CAMOFOX_URL` as the default `CAMOFOX_URL` when no explicit `CAMOFOX_URL` is set, so containerized Camofox deployments do not fall back to unreachable `127.0.0.1:9377`.
+
 ## [v0.51.137] — 2026-05-25 — Release DI (stage-batch19 — 6-PR medium-risk batch)
 
 ### Added

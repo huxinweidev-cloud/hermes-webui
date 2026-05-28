@@ -541,11 +541,32 @@ async function newSession(flash, options={}){
   }
 }
 
+async function resolveRequestedSessionId(sid, opts){
+  sid=String(sid||'').trim();
+  if(!sid) return {sessionId:null,status:'empty'};
+  opts=opts||{};
+  if(!opts.skipSidebarLineage && typeof _resolveSessionIdFromSidebarLineage==='function'){
+    const local=_resolveSessionIdFromSidebarLineage(sid);
+    if(local&&local!==sid) sid=local;
+  }
+  try{
+    const params=new URLSearchParams({session_id:sid});
+    if(S&&S.activeProfile) params.set('profile', S.activeProfile);
+    const data=await api(`/api/session/resolve?${params.toString()}`);
+    if(data&&data.canonical_visible_session_id){
+      return {sessionId:data.canonical_visible_session_id,status:data.status||'resolved',data};
+    }
+    return {sessionId:sid,status:(data&&data.status)||'unresolved',data};
+  }catch(e){
+    return {sessionId:sid,status:'resolver_error',error:e};
+  }
+}
+
 async function loadSession(sid){
   const opts = arguments[1] || {};
-  if(!opts.skipLineageResolve && typeof _resolveSessionIdFromSidebarLineage==='function'){
-    const resolvedSid=_resolveSessionIdFromSidebarLineage(sid);
-    if(resolvedSid&&resolvedSid!==sid) sid=resolvedSid;
+  if(!opts.skipLineageResolve){
+    const resolved=await resolveRequestedSessionId(sid, opts);
+    if(resolved.sessionId && resolved.sessionId !== sid) sid = resolved.sessionId;
   }
   const forceReload = !!opts.force;
   const currentSid = S.session ? S.session.session_id : null;

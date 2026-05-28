@@ -14,7 +14,7 @@ services:
       context: .
       dockerfile: Dockerfile
       args:
-        HERMES_VERSION: v0.51.134-b1-host-camofox
+        HERMES_VERSION: v0.51.137-b1-host-camofox
     restart: unless-stopped
     ports:
       - "127.0.0.1:8787:8787"
@@ -52,6 +52,7 @@ services:
       HERMES_WEB_UI_GATEWAY_AUTOSTART: "0"
       HERMES_BRIDGE_TOOLSETS: web,browser,terminal,file,skills,memory,session_search,todo,cronjob,delegation,vision
       CAMOFOX_URL: http://camofox-browser:9377
+      HERMES_WEBUI_CAMOFOX_URL: http://camofox-browser:9377
       CAMOFOX_ADOPT_EXISTING_TAB: "1"
       PYTHONUNBUFFERED: "1"
     security_opt:

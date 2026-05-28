@@ -76,3 +76,27 @@ def test_switch_profile_allows_valid_profile_name():
 
         assert result["active"] == "demo"
         assert Path(os.environ["HERMES_HOME"]).resolve() == profile_dir.resolve()
+
+
+def test_webui_camofox_url_overrides_profile_dotenv_without_splitting_profile(monkeypatch, tmp_path):
+    """WebUI containers need Docker DNS while host profiles may keep loopback."""
+    base = tmp_path / ".hermes"
+    profile_dir = base / "profiles" / "sophia"
+    profile_dir.mkdir(parents=True)
+    (profile_dir / ".env").write_text(
+        "CAMOFOX_URL=http://127.0.0.1:9377\nOTHER_KEY=kept\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv("HERMES_WEBUI_CAMOFOX_URL", "http://camofox-browser:9377")
+    profiles = _reload_profiles_module(base)
+
+    profiles._reload_dotenv(profile_dir)
+
+    assert os.environ["CAMOFOX_URL"] == "http://camofox-browser:9377"
+    assert os.environ["OTHER_KEY"] == "kept"
+
+    runtime_env = profiles.get_profile_runtime_env(profile_dir)
+    assert runtime_env["CAMOFOX_URL"] == "http://camofox-browser:9377"
+    assert runtime_env["OTHER_KEY"] == "kept"
+    assert profile_dir.name == "sophia"

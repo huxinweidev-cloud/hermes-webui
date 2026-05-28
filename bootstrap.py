@@ -71,6 +71,20 @@ def _load_repo_dotenv() -> None:
 # values from .env even when bootstrap.py is invoked directly (not via start.sh).
 _load_repo_dotenv()
 
+
+def _apply_webui_camofox_default() -> None:
+    """Mirror WebUI's Camofox endpoint to the Agent browser-tool env.
+
+    Containerized WebUI deployments use ``HERMES_WEBUI_CAMOFOX_URL`` as the
+    deployment-level variable because the endpoint may differ from host-side
+    Hermes CLI/Gateway sessions. Hermes Agent's browser tool reads
+    ``CAMOFOX_URL``. Treat the WebUI-specific variable as a default, but never
+    override an explicit ``CAMOFOX_URL`` supplied by the operator.
+    """
+    if os.getenv("HERMES_WEBUI_CAMOFOX_URL") and not os.getenv("CAMOFOX_URL"):
+        os.environ["CAMOFOX_URL"] = os.environ["HERMES_WEBUI_CAMOFOX_URL"]
+
+
 DEFAULT_HOST = os.getenv("HERMES_WEBUI_HOST", "127.0.0.1")
 DEFAULT_PORT = int(os.getenv("HERMES_WEBUI_PORT", "8787"))
 # Set HERMES_WEBUI_SKIP_ONBOARDING=1 to bypass the first-run wizard when
@@ -412,6 +426,7 @@ def main() -> int:
     os.environ["HERMES_WEBUI_HOST"] = args.host
     os.environ["HERMES_WEBUI_PORT"] = str(args.port)
     os.environ.setdefault("HERMES_WEBUI_STATE_DIR", str(state_dir))
+    _apply_webui_camofox_default()
     if agent_dir:
         os.environ["HERMES_WEBUI_AGENT_DIR"] = str(agent_dir)
 
