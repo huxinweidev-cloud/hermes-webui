@@ -616,6 +616,16 @@ function closeLiveStream(sessionId, streamId, source){
   if(source&&live.source!==source) return;
   try{live.source.close();}catch(_){ }
   delete LIVE_STREAMS[sessionId];
+  // closeLiveStream() is called during session-switch teardown for any session
+  // the user is no longer viewing. The stream is still active on the server,
+  // so mark the in-memory INFLIGHT entry for reattach — otherwise
+  // loadSession() returning to this session skips the reattach branch
+  // (`INFLIGHT.reattach` was only set by the storage-load path) and the SSE
+  // is never reopened. The user then sees no streamed tokens until the LLM
+  // finishes and a metadata refresh swaps in the final reply.
+  // If the stream is terminating cleanly, _clearOwnerInflightState() has
+  // already deleted INFLIGHT[sessionId], so this is a safe no-op.
+  if(INFLIGHT[sessionId]) INFLIGHT[sessionId].reattach=true;
 }
 
 function closeOtherLiveStreams(activeSid){
@@ -648,9 +658,16 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
   closeOtherLiveStreams(activeSid);
   closeLiveStream(activeSid);
 
-  let assistantText='';
-  let reasoningText='';
-  let liveReasoningText='';
+  // On reconnect, restore accumulated text from INFLIGHT so we don't lose
+  // progress made before the session switch. Without this the closure starts
+  // empty and tokens arriving on the new SSE connection append to nothing —
+  // the already-rendered content vanishes.
+  const _lastLiveAssistant = reconnecting
+    ? INFLIGHT[activeSid]?.messages?.findLast?.(m => m.role === 'assistant' && m._live)
+    : null;
+  let assistantText = _lastLiveAssistant ? (_lastLiveAssistant.content || '') : '';
+  let reasoningText = _lastLiveAssistant ? (_lastLiveAssistant.reasoning || '') : '';
+  let liveReasoningText = reasoningText;
   let visibleInterimSnippets=[];
   let _latestGoalStatus=null;
   let _pendingGoalContinuation=null;
@@ -836,7 +853,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       (typeof document!=='undefined'&&document.wasDiscarded===true);
   }
 
-  function _reattachOrRestoreAfterDeferredStreamError(){
+  function _reattachOrRestoreAfterDeferredStreamError(source){
     if(_terminalStateReached||_streamFinalized) return;
     if((S.session&&S.session.session_id)!==activeSid) return;
     (async()=>{
@@ -852,13 +869,13 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       }catch(_){
         if(_deferStreamErrorIfOffline()||_pageHiddenForStreamError()) return;
       }
-      if(await _restoreSettledSession()) return;
+      if(await _restoreSettledSession(source)) return;
       if(_deferStreamErrorIfOffline()||_pageHiddenForStreamError()) return;
-      _handleStreamError();
+      _handleStreamError(source);
     })();
   }
 
-  function _deferStreamErrorIfPageHidden(){
+  function _deferStreamErrorIfPageHidden(source){
     if(!_pageHiddenForStreamError()) return false;
     setComposerStatus('Connection paused. Reconnecting when this tab returns…');
     if(S.session&&S.session.session_id===activeSid&&streamId) S.activeStreamId=streamId;
@@ -870,7 +887,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
         window.removeEventListener('pageshow',resume);
         document.removeEventListener('visibilitychange',resume);
         _deferredStreamRecoveryBound=false;
-        _reattachOrRestoreAfterDeferredStreamError();
+        _reattachOrRestoreAfterDeferredStreamError(source);
       };
       document.addEventListener('visibilitychange',resume);
       window.addEventListener('focus',resume);
@@ -1003,8 +1020,35 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     _smdWrittenLen=0;
     _smdWrittenText='';
     if(!window.smd){_smdParser=null;return;}
-    const renderer=fade ? _streamFadeRenderer(el) : window.smd.default_renderer(el);
+    const baseRenderer=fade ? _streamFadeRenderer(el) : window.smd.default_renderer(el);
+    const renderer=_smdRendererWithoutUnderscoreEmphasis(baseRenderer);
     _smdParser=window.smd.parser(renderer);
+  }
+  function _smdRendererWithoutUnderscoreEmphasis(renderer){
+    if(!renderer||!window.smd) return renderer;
+    const baseAddToken=renderer.add_token;
+    const baseEndToken=renderer.end_token;
+    const baseAddText=renderer.add_text;
+    const tokenStack=[];
+    renderer.add_token=(data,token)=>{
+      if(token===window.smd.ITALIC_UND||token===window.smd.STRONG_UND){
+        const marker=token===window.smd.STRONG_UND?'__':'_';
+        tokenStack.push(marker);
+        baseAddText(data,marker);
+        return;
+      }
+      tokenStack.push(null);
+      baseAddToken(data,token);
+    };
+    renderer.end_token=(data)=>{
+      const marker=tokenStack.pop();
+      if(marker){
+        baseAddText(data,marker);
+        return;
+      }
+      baseEndToken(data);
+    };
+    return renderer;
   }
   // Helper: end the current smd parser (flushes remaining state) and null it out.
   function _smdEndParser(){
@@ -1056,8 +1100,16 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
   // Raw file:// anchors are rewritten to /api/media before the user can click them.
   const _SMD_SAFE_URL_RE=/^(?:https?:|mailto:|tel:|\/|#|\?|\.|api)/i;
   const _SMD_SAFE_IMG_URL_RE=/^(?:https?:|mailto:|tel:|\/|#|\?|\.)/i;
-  function _smdFileHref(raw){
+  function _smdLinkHref(raw){
     const href=String(raw||'');
+    if(/^workspace:\/\//i.test(href)){
+      try{
+        const rel=decodeURIComponent(href.replace(/^workspace:\/\//i,'')).replace(/^~\//,'').replace(/^\.\//,'');
+        return '#workspace='+encodeURIComponent(rel);
+      }catch(_){
+        return '#';
+      }
+    }
     if(!/^file:\/\//i.test(href)) return href;
     try{
       const path=decodeURIComponent(href.replace(/^file:\/\//i,''));
@@ -1066,12 +1118,15 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       return 'api/media?path='+encodeURIComponent(href.replace(/^file:\/\//i,''))+'&inline=1';
     }
   }
+  function _smdFileHref(raw){
+    return _smdLinkHref(raw);
+  }
   function _sanitizeSmdLinks(root){
     if(!root||!root.querySelectorAll) return;
     const _a=root.querySelectorAll('a[href]');
     for(let i=0;i<_a.length;i++){
       const n=_a[i],v=n.getAttribute('href')||'';
-      if(/^file:\/\//i.test(v)){n.setAttribute('href',_smdFileHref(v));continue;}
+      if(/^(file|workspace):\/\//i.test(v)){n.setAttribute('href',_smdLinkHref(v));continue;}
       if(!_SMD_SAFE_URL_RE.test(v)){n.removeAttribute('href');n.setAttribute('data-blocked-scheme','1');}
     }
     const _im=root.querySelectorAll('img[src]');
@@ -1182,8 +1237,8 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       const isHref=window.smd&&attr===window.smd.HREF;
       const isSrc=window.smd&&attr===window.smd.SRC;
       const safeUrl=isSrc?_SMD_SAFE_IMG_URL_RE:_SMD_SAFE_URL_RE;
-      if(isHref&&/^file:\/\//i.test(String(value||''))){
-        baseSetAttr(data,attr,_smdFileHref(value));
+      if(isHref&&/^(file|workspace):\/\//i.test(String(value||''))){
+        baseSetAttr(data,attr,_smdLinkHref(value));
         return;
       }
       if((isHref||isSrc)&&!safeUrl.test(String(value||''))){
@@ -1352,9 +1407,10 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     };
     step();
   }
-  function _flushPendingSegmentRender(){
-    if(!assistantBody||!_renderPending) return;
-    _cancelAnimationFramePendingStreamRender();
+  function _flushPendingSegmentRender(options={}){
+    const force=!!(options&&options.force);
+    if(!assistantBody||(!force&&!_renderPending)) return;
+    if(_renderPending) _cancelAnimationFramePendingStreamRender();
     const displayText=segmentStart===0
       ? _parseStreamState().displayText
       : _stripXmlToolCalls(assistantText.slice(segmentStart));
@@ -1512,8 +1568,9 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
         if(typeof updateThinking==='function') updateThinking(_liveThinkingText());
         else appendThinking(_liveThinkingText());
       }
-      _flushPendingSegmentRender();
       ensureAssistantRow(true);
+      _flushPendingSegmentRender({force:true});
+      if(typeof closeCurrentLiveActivityGroup==='function') closeCurrentLiveActivityGroup();
       _resetAssistantSegment();
       _scheduleRender();
     });
@@ -1565,7 +1622,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       // Reset the live assistant row reference so that any text tokens arriving
       // after this tool call create a NEW segment appended below the tool card,
       // rather than updating the old segment that sits above it in the DOM.
-      _flushPendingSegmentRender();
+      _flushPendingSegmentRender({force:true});
       _freshSegment=true;
       _smdEndParser();
       _resetAssistantSegment();
@@ -1887,7 +1944,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
 
     source.addEventListener('stream_end',async e=>{
       if(_streamFinalized){
-        source.close();
+        _closeSource(source);
         return;
       }
       _terminalStateReached=true;
@@ -1900,8 +1957,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       // live DOM/inflight state remains projected and can duplicate Thinking or
       // assistant content until a later session switch. Settle from the persisted
       // session before closing so the pane converges on canonical state.
-      if(await _restoreSettledSession()){
-        source.close();
+      if(await _restoreSettledSession(source)){
         return;
       }
       if(_persistTimer){clearTimeout(_persistTimer);_persistTimer=null;}
@@ -1910,7 +1966,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       _streamFadeCleanupReduceMotionListener();
       _smdEndParser();
       if(typeof finalizeThinkingCard==='function') finalizeThinkingCard();
-      source.close();
+      _closeSource(source);
     });
 
     source.addEventListener('pending_steer_leftover',e=>{
@@ -2094,8 +2150,15 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       if(typeof recordClientSSEError==='function') recordClientSSEError('chat-response',{ready_state:source?source.readyState:null,session_id:activeSid,stream_id:streamId,reason:'chat EventSource.onerror'});
       source.close();
       if(_deferStreamErrorIfOffline()) return;
-      if(_deferStreamErrorIfPageHidden()) return;
+      if(_deferStreamErrorIfPageHidden(source)) return;
       _closeSource(source);
+      // If the user has switched to a different session, don't attempt to
+      // reconnect — the old stream's EventSource was closed intentionally
+      // during session switch and reconnecting would leak a background stream.
+      if(!_isSessionActivelyViewed(activeSid)) return;
+      if(_terminalStateReached || _streamFinalized){
+        return;
+      }
       // Attempt one reconnect if the stream is still active server-side
       if(!_reconnectAttempted && streamId){
         _reconnectAttempted=true;
@@ -2116,17 +2179,17 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
           }catch(_){
             if(_deferStreamErrorIfOffline()) return;
           }
-          if(await _restoreSettledSession()) return;
+          if(await _restoreSettledSession(source)) return;
           if(_deferStreamErrorIfOffline()) return;
-          if(_deferStreamErrorIfPageHidden()) return;
-          _handleStreamError();
+          if(_deferStreamErrorIfPageHidden(source)) return;
+          _handleStreamError(source);
         },1500);
         return;
       }
-      if(await _restoreSettledSession()) return;
+      if(await _restoreSettledSession(source)) return;
       if(_deferStreamErrorIfOffline()) return;
-      if(_deferStreamErrorIfPageHidden()) return;
-      _handleStreamError();
+      if(_deferStreamErrorIfPageHidden(source)) return;
+      _handleStreamError(source);
     });
 
     source.addEventListener('cancel',e=>{
@@ -2176,7 +2239,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     }
   }
 
-  async function _restoreSettledSession(){
+  async function _restoreSettledSession(source){
     try{
       const data=await api(`/api/session?session_id=${encodeURIComponent(activeSid)}`);
       // Opus #2852 race-fix: if a late `done` event ran the finalize path while
@@ -2192,7 +2255,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       _smdEndParser();
       if(typeof finalizeThinkingCard==='function') finalizeThinkingCard();
       _clearOwnerInflightState();
-      _closeSource();
+      _closeSource(source);
       _clearApprovalForOwner();
       _clearClarifyForOwner('terminal');
       const isSessionViewed=_isSessionActivelyViewed(activeSid);
@@ -2239,7 +2302,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     }
   }
 
-  function _handleStreamError(){
+  function _handleStreamError(source){
     // Opus review Q1: mirror done/apperror/cancel finalization so any pending rAF
     // cannot fire after renderMessages() has settled the DOM with the error message.
     if(_persistTimer){clearTimeout(_persistTimer);_persistTimer=null;}
@@ -2248,7 +2311,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     _streamFadeCleanupReduceMotionListener();
     if(typeof finalizeThinkingCard==='function') finalizeThinkingCard();
     _clearOwnerInflightState();
-    _closeSource();
+    _closeSource(source);
     _clearApprovalForOwner();
     _clearClarifyForOwner('terminal');
     if(S.session&&S.session.session_id===activeSid){

@@ -312,11 +312,8 @@ def test_deleted_session_does_not_appear_in_list(cleanup_test_sessions):
     assert sid not in ids_after,         f"Deleted session {sid} still appears in list -- index not invalidated on delete"
 
 
-def test_server_delete_invalidates_index(cleanup_test_sessions):
-    """R8b: session/delete handler must unlink _index.json.
-    Static check that the fix is in place.
-    Sprint 11: handler moved from server.py to api/routes.py -- check both.
-    """
+def test_server_delete_prunes_session_index(cleanup_test_sessions):
+    """session/delete should prune the deleted row without discarding the index."""
     src = (REPO_ROOT / "server.py").read_text()
     routes_src = (REPO_ROOT / "api" / "routes.py").read_text() if (REPO_ROOT / "api" / "routes.py").exists() else ""
     # Find the delete handler in either file
@@ -327,12 +324,9 @@ def test_server_delete_invalidates_index(cleanup_test_sessions):
             text.find('if parsed.path == "/api/session/delete":'),
         )
         if delete_idx >= 0:
-            # Use 1200 chars to accommodate any validation/guard code added
-            # before the SESSION_INDEX_FILE.unlink() call (e.g. session_id
-            # character checks, path traversal guards).
-            delete_block = text[delete_idx:delete_idx+1200]
-            assert "SESSION_INDEX_FILE" in delete_block, \
-                f"{label} session/delete must invalidate SESSION_INDEX_FILE"
+            delete_block = text[delete_idx:delete_idx+1800]
+            assert "prune_session_from_index(sid)" in delete_block, \
+                f"{label} session/delete must prune SESSION_INDEX_FILE"
             return
     assert False, "session/delete handler not found in server.py or api/routes.py"
 
@@ -767,9 +761,13 @@ def test_messages_js_supports_live_reasoning_and_tool_completion(cleanup_test_se
     until the final done snapshot redraws the whole turn.
     """
     src = (REPO_ROOT / "static/messages.js").read_text()
-    assert "let reasoningText=''" in src, \
+    # reasoningText is initialised at closure scope in attachLiveStream.
+    # On initial connect it defaults to ''; on reconnect it restores from
+    # INFLIGHT so the already-rendered content survives the session switch.
+    assert ("let reasoningText=''" in src
+            or "let reasoningText = _lastLiveAssistant" in src), \
         "messages.js must track streamed reasoning text separately from assistant text"
-    assert "let liveReasoningText=''" in src or 'let liveReasoningText = ""' in src, \
+    assert ("let liveReasoningText=''" in src or "let liveReasoningText = reasoningText" in src), \
         "messages.js must track the currently active reasoning segment separately from cumulative reasoning"
     assert "source.addEventListener('reasoning'" in src or 'source.addEventListener("reasoning"' in src, \
         "messages.js must listen for live reasoning SSE events"

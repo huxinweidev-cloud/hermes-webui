@@ -774,6 +774,18 @@ const LOCALES = {
     insights_model_share: 'Share',
     insights_no_usage_data: 'No usage data yet',
     insights_footer: 'Showing data from the last {days} days',
+    insights_skill_usage_title: 'Skill Usage',
+    insights_skill_usage_sub: 'Tool invocation frequency',
+    insights_skill_usage_total: 'Total invocations',
+    insights_skill_usage_skills_used: 'Skills used',
+    insights_skill_usage_no_data: 'No skill usage data yet',
+    insights_skill_usage_no_data_hint: 'Skills will appear here once used in conversations.',
+    insights_skill_usage_footer: 'Counts from ~/.hermes/skills/',
+    insights_skill_usage_col_skill: 'Skill',
+    insights_skill_usage_col_uses: 'Uses',
+    insights_skill_usage_col_views: 'Views',
+    insights_skill_usage_col_share: 'Usage %',
+    insights_skill_usage_col_patches: 'Patches',
     workspace_desc: 'Add and switch workspaces for your sessions.',
     session_meta_messages: (n) => `${n} msg${n === 1 ? '' : 's'}`,
     session_meta_children: (n) => `${n} child${n === 1 ? '' : 'ren'}`,
@@ -1206,6 +1218,7 @@ const LOCALES = {
     cron_prompt_label: 'Prompt',
     cron_deliver_label: 'Deliver output to',
     cron_deliver_local: 'Local (save output only)',
+    cron_deliver_custom: 'Custom delivery target',
     cron_profile_label: 'Profile',
     cron_profile_server_default: 'server default',
     cron_profile_server_default_hint: 'Uses the WebUI server default profile at run time. Existing jobs without a profile keep this legacy behavior.',
@@ -2048,6 +2061,18 @@ const LOCALES = {
     insights_model_share: 'Quota',
     insights_no_usage_data: 'Nessun dato di utilizzo',
     insights_footer: 'Dati mostrati dagli ultimi {days} giorni',
+    insights_skill_usage_title: 'Utilizzo Skill',
+    insights_skill_usage_sub: 'Frequenza di invocazione strumenti',
+    insights_skill_usage_total: 'Invocazioni totali',
+    insights_skill_usage_skills_used: 'Skill usate',
+    insights_skill_usage_no_data: 'Nessun dato di utilizzo skill ancora',
+    insights_skill_usage_no_data_hint: 'Le skill appariranno qui dopo essere state usate nelle conversazioni.',
+    insights_skill_usage_footer: 'Conteggi da ~/.hermes/skills/',
+    insights_skill_usage_col_skill: 'Abilità',
+    insights_skill_usage_col_uses: 'Usi',
+    insights_skill_usage_col_views: 'Visualizzazioni',
+    insights_skill_usage_col_share: 'Utilizzo %',
+    insights_skill_usage_col_patches: 'Patch',
     workspace_desc: 'Aggiungi e cambia workspace per le tue sessioni.',
     session_meta_messages: (n) => `${n} msg`,
     session_meta_children: (n) => `${n} figli${n === 1 ? 'o' : ''}`,
@@ -2477,6 +2502,7 @@ const LOCALES = {
     cron_prompt_label: 'Prompt',
     cron_deliver_label: 'Recapita output a',
     cron_deliver_local: 'Locale (solo salva output)',
+    cron_deliver_custom: 'Destinazione personalizzata',
     cron_profile_label: 'Profilo',
     cron_profile_server_default: 'predefinito server',
     cron_profile_server_default_hint: 'Usa il profilo predefinito del server WebUI a runtime. I job esistenti senza profilo mantengono questo comportamento legacy.',
@@ -3324,6 +3350,18 @@ const LOCALES = {
     insights_model_share: 'シェア',
     insights_no_usage_data: '使用データはまだありません',
     insights_footer: '直近 {days} 日間のデータを表示',
+    insights_skill_usage_title: 'スキル使用状況',
+    insights_skill_usage_sub: 'ツール呼び出し頻度',
+    insights_skill_usage_total: '総呼び出し数',
+    insights_skill_usage_skills_used: '使用スキル数',
+    insights_skill_usage_no_data: 'スキル使用データがまだありません',
+    insights_skill_usage_no_data_hint: '会話でスキルを使用すると、ここに表示されます。',
+    insights_skill_usage_footer: 'データ元: ~/.hermes/skills/',
+    insights_skill_usage_col_skill: 'スキル',
+    insights_skill_usage_col_uses: '使用回数',
+    insights_skill_usage_col_views: '閲覧数',
+    insights_skill_usage_col_share: '使用率',
+    insights_skill_usage_col_patches: 'パッチ',
     workspace_desc: 'セッション用のワークスペースを追加・切り替えします。',
     session_meta_messages: (n) => `${n} 件`,
     session_meta_children: (n) => `${n} 子`,
@@ -3753,6 +3791,7 @@ const LOCALES = {
     cron_prompt_label: 'プロンプト',
     cron_deliver_label: '出力先',
     cron_deliver_local: 'ローカル (出力を保存のみ)',
+    cron_deliver_custom: 'カスタム配信先',
     cron_profile_label: 'プロフィール',
     cron_profile_server_default: 'サーバーデフォルト',
     cron_profile_server_default_hint: '実行時に WebUI サーバーのデフォルトプロフィールを使用します。プロフィールのない既存ジョブはこの従来の動作を維持します。',
@@ -4793,6 +4832,7 @@ const LOCALES = {
     cron_prompt_label: 'Запрос',
     cron_deliver_label: 'Доставлять вывод',
     cron_deliver_local: 'Локально (только сохранение)',
+    cron_deliver_custom: 'Пользовательская доставка',
     cron_profile_label: 'Профиль',
     cron_profile_server_default: 'по умолчанию сервера',
     cron_profile_server_default_hint: 'Использует профиль WebUI-сервера по умолчанию во время запуска. Существующие задания без профиля сохраняют это поведение.',
@@ -5028,6 +5068,18 @@ const LOCALES = {
     insights_model_share: 'Share',
     insights_no_usage_data: 'No usage data yet',
     insights_footer: 'Showing data from the last {days} days',  // TODO: translate
+    insights_skill_usage_title: 'Skill Usage',  // TODO: translate
+    insights_skill_usage_sub: 'Tool invocation frequency',  // TODO: translate
+    insights_skill_usage_total: 'Total invocations',  // TODO: translate
+    insights_skill_usage_skills_used: 'Skills used',  // TODO: translate
+    insights_skill_usage_no_data: 'No skill usage data yet',  // TODO: translate
+    insights_skill_usage_no_data_hint: 'Skills will appear here once used in conversations.',  // TODO: translate
+    insights_skill_usage_footer: 'Counts from ~/.hermes/skills/',  // TODO: translate
+    insights_skill_usage_col_skill: 'Skill',  // TODO: translate
+    insights_skill_usage_col_uses: 'Uses',  // TODO: translate
+    insights_skill_usage_col_views: 'Views',  // TODO: translate
+    insights_skill_usage_col_share: 'Usage %',  // TODO: translate
+    insights_skill_usage_col_patches: 'Patches',  // TODO: translate
     insights_input_tokens: 'Input',  // TODO: translate
     insights_messages: 'Messages',  // TODO: translate
     insights_models: 'Models',  // TODO: translate
@@ -5990,6 +6042,7 @@ const LOCALES = {
     cron_prompt_label: 'Prompt',
     cron_deliver_label: 'Entregar salida a',
     cron_deliver_local: 'Local (solo guardar salida)',
+    cron_deliver_custom: 'Destino personalizado',
     cron_profile_label: 'Perfil',
     cron_profile_server_default: 'predeterminado del servidor',
     cron_profile_server_default_hint: 'Usa el perfil predeterminado del servidor WebUI durante la ejecución. Los trabajos existentes sin perfil conservan este comportamiento heredado.',
@@ -6225,6 +6278,18 @@ const LOCALES = {
     insights_model_share: 'Share',
     insights_no_usage_data: 'No usage data yet',
     insights_footer: 'Showing data from the last {days} days',  // TODO: translate
+    insights_skill_usage_title: 'Skill Usage',  // TODO: translate
+    insights_skill_usage_sub: 'Tool invocation frequency',  // TODO: translate
+    insights_skill_usage_total: 'Total invocations',  // TODO: translate
+    insights_skill_usage_skills_used: 'Skills used',  // TODO: translate
+    insights_skill_usage_no_data: 'No skill usage data yet',  // TODO: translate
+    insights_skill_usage_no_data_hint: 'Skills will appear here once used in conversations.',  // TODO: translate
+    insights_skill_usage_footer: 'Counts from ~/.hermes/skills/',  // TODO: translate
+    insights_skill_usage_col_skill: 'Skill',  // TODO: translate
+    insights_skill_usage_col_uses: 'Uses',  // TODO: translate
+    insights_skill_usage_col_views: 'Views',  // TODO: translate
+    insights_skill_usage_col_share: 'Usage %',  // TODO: translate
+    insights_skill_usage_col_patches: 'Patches',  // TODO: translate
     insights_input_tokens: 'Input',  // TODO: translate
     insights_messages: 'Messages',  // TODO: translate
     insights_models: 'Models',  // TODO: translate
@@ -6903,6 +6968,7 @@ const LOCALES = {
     cron_prompt_label: 'Prompt',
     cron_deliver_label: 'Ausgabe senden an',
     cron_deliver_local: 'Lokal (nur speichern)',
+    cron_deliver_custom: 'Benutzerdefiniertes Ziel',
     cron_profile_label: 'Profil',
     cron_profile_server_default: 'Serverstandard',
     cron_profile_server_default_hint: 'Verwendet zur Laufzeit das Standardprofil des WebUI-Servers. Bestehende Jobs ohne Profil behalten dieses Legacy-Verhalten.',
@@ -7437,6 +7503,18 @@ const LOCALES = {
     insights_model_share: 'Share',
     insights_no_usage_data: 'No usage data yet',
     insights_footer: 'Showing data from the last {days} days',  // TODO: translate
+    insights_skill_usage_title: 'Skill Usage',  // TODO: translate
+    insights_skill_usage_sub: 'Tool invocation frequency',  // TODO: translate
+    insights_skill_usage_total: 'Total invocations',  // TODO: translate
+    insights_skill_usage_skills_used: 'Skills used',  // TODO: translate
+    insights_skill_usage_no_data: 'No skill usage data yet',  // TODO: translate
+    insights_skill_usage_no_data_hint: 'Skills will appear here once used in conversations.',  // TODO: translate
+    insights_skill_usage_footer: 'Counts from ~/.hermes/skills/',  // TODO: translate
+    insights_skill_usage_col_skill: 'Skill',  // TODO: translate
+    insights_skill_usage_col_uses: 'Uses',  // TODO: translate
+    insights_skill_usage_col_views: 'Views',  // TODO: translate
+    insights_skill_usage_col_share: 'Usage %',  // TODO: translate
+    insights_skill_usage_col_patches: 'Patches',  // TODO: translate
     insights_input_tokens: 'Input',  // TODO: translate
     insights_messages: 'Messages',  // TODO: translate
     insights_models: 'Models',  // TODO: translate
@@ -8417,6 +8495,7 @@ const LOCALES = {
     cron_prompt_label: '提示词',
     cron_deliver_label: '输出位置',
     cron_deliver_local: '本地（仅保存输出）',
+    cron_deliver_custom: '自定义推送目标',
     cron_profile_label: '配置档',
     cron_profile_server_default: '服务器默认',
     cron_profile_server_default_hint: '运行时使用 WebUI 服务器默认配置档。没有配置档的现有作业会保留此旧行为。',
@@ -8642,6 +8721,18 @@ const LOCALES = {
     insights_model_share: '占比',
     insights_no_usage_data: '暂无使用数据',
     insights_footer: '显示最近 {days} 天的数据',
+    insights_skill_usage_title: '技能使用统计',
+    insights_skill_usage_sub: '工具调用频次',
+    insights_skill_usage_total: '总调用次数',
+    insights_skill_usage_skills_used: '已使用技能',
+    insights_skill_usage_no_data: '暂无技能使用数据',
+    insights_skill_usage_no_data_hint: '在对话中使用技能后，数据将在此显示。',
+    insights_skill_usage_footer: '数据来源于 ~/.hermes/skills/',
+    insights_skill_usage_col_skill: '技能',
+    insights_skill_usage_col_uses: '使用次数',
+    insights_skill_usage_col_views: '查看次数',
+    insights_skill_usage_col_share: '使用占比',
+    insights_skill_usage_col_patches: '补丁',
     insights_input_tokens: '输入',
     insights_messages: '消息',
     insights_models: '模型',
@@ -9841,6 +9932,7 @@ const LOCALES = {
     cron_prompt_label: '提示',
     cron_deliver_label: '發送至',
     cron_deliver_local: '僅本地儲存',
+    cron_deliver_custom: '自訂推送目標',
     cron_profile_label: '設定檔',
     cron_profile_server_default: '伺服器預設',
     cron_profile_server_default_hint: '執行時使用 WebUI 伺服器預設設定檔。沒有設定檔的既有工作會保留此舊行為。',
@@ -9928,6 +10020,18 @@ const LOCALES = {
     insights_model_share: 'Share',
     insights_no_usage_data: 'No usage data yet',
     insights_footer: 'Showing data from the last {days} days',  // TODO: translate
+    insights_skill_usage_title: '技能使用統計',
+    insights_skill_usage_sub: '工具調用頻次',
+    insights_skill_usage_total: '總調用次數',
+    insights_skill_usage_skills_used: '已使用技能',
+    insights_skill_usage_no_data: '暫無技能使用數據',
+    insights_skill_usage_no_data_hint: '在會話中使用技能後，數據將在此顯示。',
+    insights_skill_usage_footer: '數據來源於 ~/.hermes/skills/',
+    insights_skill_usage_col_skill: 'Skill',  // TODO: translate
+    insights_skill_usage_col_uses: 'Uses',  // TODO: translate
+    insights_skill_usage_col_views: 'Views',  // TODO: translate
+    insights_skill_usage_col_share: 'Usage %',  // TODO: translate
+    insights_skill_usage_col_patches: 'Patches',  // TODO: translate
     insights_input_tokens: 'Input',  // TODO: translate
     insights_messages: 'Messages',  // TODO: translate
     insights_models: 'Models',  // TODO: translate
@@ -10919,6 +11023,7 @@ const LOCALES = {
     cron_prompt_label: 'Prompt',
     cron_deliver_label: 'Entregar output para',
     cron_deliver_local: 'Local (salvar output apenas)',
+    cron_deliver_custom: 'Destino personalizado',
     cron_profile_label: 'Perfil',
     cron_profile_server_default: 'padrão do servidor',
     cron_profile_server_default_hint: 'Usa o perfil padrão do servidor WebUI no momento da execução. Tarefas existentes sem perfil mantêm esse comportamento legado.',
@@ -11015,6 +11120,18 @@ const LOCALES = {
     insights_activity_by_hour: 'Activity by Hour',  // TODO: translate
     insights_cost: 'Estimated Cost',  // TODO: translate
     insights_footer: 'Showing data from the last {days} days',  // TODO: translate
+    insights_skill_usage_title: 'Skill Usage',  // TODO: translate
+    insights_skill_usage_sub: 'Tool invocation frequency',  // TODO: translate
+    insights_skill_usage_total: 'Total invocations',  // TODO: translate
+    insights_skill_usage_skills_used: 'Skills used',  // TODO: translate
+    insights_skill_usage_no_data: 'No skill usage data yet',  // TODO: translate
+    insights_skill_usage_no_data_hint: 'Skills will appear here once used in conversations.',  // TODO: translate
+    insights_skill_usage_footer: 'Counts from ~/.hermes/skills/',  // TODO: translate
+    insights_skill_usage_col_skill: 'Skill',  // TODO: translate
+    insights_skill_usage_col_uses: 'Uses',  // TODO: translate
+    insights_skill_usage_col_views: 'Views',  // TODO: translate
+    insights_skill_usage_col_share: 'Usage %',  // TODO: translate
+    insights_skill_usage_col_patches: 'Patches',  // TODO: translate
     insights_input_tokens: 'Input',  // TODO: translate
     insights_messages: 'Messages',  // TODO: translate
     insights_models: 'Models',  // TODO: translate
@@ -12163,6 +12280,7 @@ const LOCALES = {
     cron_prompt_label: 'Prompt',
     cron_deliver_label: 'Deliver output to',
     cron_deliver_local: 'Local (save output only)',
+    cron_deliver_custom: '사용자 지정 전달 대상',
     cron_profile_label: 'Profile',
     cron_profile_server_default: 'server default',
     cron_profile_server_default_hint: 'Uses the WebUI server default profile at run time. Existing jobs without a profile keep this legacy behavior.',
@@ -12279,6 +12397,18 @@ const LOCALES = {
     insights_model_share: '비율',
     insights_no_usage_data: '아직 사용 데이터가 없습니다',
     insights_footer: 'Showing data from the last {days} days',  // TODO: translate
+    insights_skill_usage_title: 'Skill Usage',  // TODO: translate
+    insights_skill_usage_sub: 'Tool invocation frequency',  // TODO: translate
+    insights_skill_usage_total: 'Total invocations',  // TODO: translate
+    insights_skill_usage_skills_used: 'Skills used',  // TODO: translate
+    insights_skill_usage_no_data: 'No skill usage data yet',  // TODO: translate
+    insights_skill_usage_no_data_hint: 'Skills will appear here once used in conversations.',  // TODO: translate
+    insights_skill_usage_footer: 'Counts from ~/.hermes/skills/',  // TODO: translate
+    insights_skill_usage_col_skill: 'Skill',  // TODO: translate
+    insights_skill_usage_col_uses: 'Uses',  // TODO: translate
+    insights_skill_usage_col_views: 'Views',  // TODO: translate
+    insights_skill_usage_col_share: 'Usage %',  // TODO: translate
+    insights_skill_usage_col_patches: 'Patches',  // TODO: translate
     insights_input_tokens: 'Input',  // TODO: translate
     insights_messages: 'Messages',  // TODO: translate
     insights_models: 'Models',  // TODO: translate
@@ -12937,6 +13067,18 @@ const LOCALES = {
     insights_model_share: 'Partager',
     insights_no_usage_data: 'Aucune donnée d\'utilisation pour l\'instant',
     insights_footer: 'Affichage des données des {days} derniers jours',
+    insights_skill_usage_title: 'Utilisation des Skills',
+    insights_skill_usage_sub: 'Fréquence d\'invocation des outils',
+    insights_skill_usage_total: 'Invocations totales',
+    insights_skill_usage_skills_used: 'Skills utilisés',
+    insights_skill_usage_no_data: 'Aucune donnée d\'utilisation des skills pour le moment',
+    insights_skill_usage_no_data_hint: 'Les skills apparaîtront ici une fois utilisés dans les conversations.',
+    insights_skill_usage_footer: 'Comptages depuis ~/.hermes/skills/',
+    insights_skill_usage_col_skill: 'Skill',  // TODO: translate
+    insights_skill_usage_col_uses: 'Uses',  // TODO: translate
+    insights_skill_usage_col_views: 'Views',  // TODO: translate
+    insights_skill_usage_col_share: 'Usage %',  // TODO: translate
+    insights_skill_usage_col_patches: 'Patches',  // TODO: translate
     workspace_desc: 'Ajoutez et changez d\'espace de travail pour vos sessions.',
     session_lineage_segment_untitled: 'Segment sans titre',
     session_lineage_segment_open: 'Segment de lignée ouverte',
@@ -13340,6 +13482,7 @@ const LOCALES = {
     cron_prompt_label: 'Rapide',
     cron_deliver_label: 'Livrer la sortie à',
     cron_deliver_local: 'Local (enregistrer la sortie uniquement)',
+    cron_deliver_custom: 'Destination personnalisee',
     cron_profile_label: 'Profil',
     cron_profile_server_default: 'serveur par défaut',
     cron_profile_server_default_hint: 'Utilise le profil par défaut du serveur WebUI au moment de l\'exécution. Les tâches existantes sans profil conservent ce comportement hérité.',
@@ -14638,6 +14781,7 @@ const LOCALES = {
     cron_prompt_label: 'Çabuk',
     cron_deliver_label: 'Çıktıyı şuraya ilet:',
     cron_deliver_local: 'Yerel (yalnızca çıktıyı kaydet)',
+    cron_deliver_custom: 'Ozel teslimat hedefi',
     cron_profile_label: 'Profil',
     cron_profile_server_default: 'sunucu varsayılanı',
     cron_profile_server_default_hint: 'Çalışma zamanında WebUI sunucusunun varsayılan profilini kullanır. Profili olmayan mevcut işler bu eski davranışı sürdürüyor.',
@@ -14754,6 +14898,18 @@ const LOCALES = {
     insights_model_share: 'Paylaşmak',
     insights_no_usage_data: 'Henüz kullanım verisi yok',
     insights_footer: 'Son {days} günün verileri gösteriliyor',
+    insights_skill_usage_title: 'Skill Usage',  // TODO: translate
+    insights_skill_usage_sub: 'Tool invocation frequency',  // TODO: translate
+    insights_skill_usage_total: 'Total invocations',  // TODO: translate
+    insights_skill_usage_skills_used: 'Skills used',  // TODO: translate
+    insights_skill_usage_no_data: 'No skill usage data yet',  // TODO: translate
+    insights_skill_usage_no_data_hint: 'Skills will appear here once used in conversations.',  // TODO: translate
+    insights_skill_usage_footer: 'Counts from ~/.hermes/skills/',  // TODO: translate
+    insights_skill_usage_col_skill: 'Skill',  // TODO: translate
+    insights_skill_usage_col_uses: 'Uses',  // TODO: translate
+    insights_skill_usage_col_views: 'Views',  // TODO: translate
+    insights_skill_usage_col_share: 'Usage %',  // TODO: translate
+    insights_skill_usage_col_patches: 'Patches',  // TODO: translate
     insights_input_tokens: 'Giriş',
     insights_messages: 'Mesajlar',
     insights_models: 'Modeller',

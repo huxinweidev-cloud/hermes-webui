@@ -54,6 +54,29 @@ _INDEX_WRITE_LOCK = threading.RLock()
 _SESSION_INDEX_REBUILD_LOCK = threading.Lock()
 _SESSION_INDEX_REBUILD_THREAD = None
 
+# Path-safety contract for session IDs.  Accept alphanumerics, underscore, and
+# hyphen so API/gateway-issued ids (``api-*``, ``reachy-voice-*``) round-trip
+# through filesystem load/save/delete/worktree paths without traversal risk.
+# Dots and slashes are rejected so the id can never name a parent directory
+# or hide an unexpected extension.
+_SAFE_SID_CHARS = frozenset(
+    '0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_-'
+)
+
+
+def is_safe_session_id(sid) -> bool:
+    """Return True iff ``sid`` is a non-empty path-safe session id.
+
+    Centralizes the validation previously duplicated across
+    ``Session.load``, ``Session.load_metadata_only``,
+    ``_repair_stale_pending``, ``/api/session/worktree/remove``, and
+    ``/api/session/delete`` so every call site agrees on what characters
+    are allowed.  See #3023.
+    """
+    if not sid or not isinstance(sid, str):
+        return False
+    return all(c in _SAFE_SID_CHARS for c in sid)
+
 
 def _cleanup_stale_tmp_files() -> None:
     """Best-effort removal of stale ``*.tmp.*`` files from SESSION_DIR.
@@ -236,6 +259,44 @@ def _write_session_index(updates=None):
 
     if _fallback:
         # Corrupt or missing index — fall back to full rebuild (called outside LOCK to avoid deadlock)
+        _write_session_index(updates=None)
+
+
+def prune_session_from_index(session_id: str) -> None:
+    """Remove one session row from the persisted sidebar index if present."""
+    sid = str(session_id or "")
+    if not sid or not SESSION_INDEX_FILE.exists():
+        return
+    _tmp = SESSION_INDEX_FILE.with_suffix(f'.tmp.{os.getpid()}.{threading.current_thread().ident}')
+
+    _fallback = False
+    with _INDEX_WRITE_LOCK:
+        try:
+            with LOCK:
+                existing = json.loads(SESSION_INDEX_FILE.read_text(encoding='utf-8'))
+                if not isinstance(existing, list):
+                    raise ValueError("session index must be a list")
+                pruned = [e for e in existing if e.get('session_id') != sid]
+                if len(pruned) == len(existing):
+                    return
+                _payload = json.dumps(pruned, ensure_ascii=False, indent=2)
+
+            try:
+                with open(_tmp, 'w', encoding='utf-8') as f:
+                    f.write(_payload)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(_tmp, SESSION_INDEX_FILE)
+            except Exception:
+                try:
+                    _tmp.unlink(missing_ok=True)
+                except Exception:
+                    pass
+                raise
+        except Exception:
+            _fallback = True
+
+    if _fallback:
         _write_session_index(updates=None)
 
 
@@ -576,9 +637,10 @@ class Session:
             'enabled_toolsets', 'composer_draft',
         ]
         meta = {k: getattr(self, k, None) for k in METADATA_FIELDS}
+        meta['message_count'] = len(self.messages or [])
         meta['messages'] = self.messages
         meta['tool_calls'] = self.tool_calls
-        # Fields not in METADATA_FIELDS (e.g. last_usage, message_count) go at the end
+        # Fields not in METADATA_FIELDS (e.g. last_usage) go at the end
         extra = {k: v for k, v in self.__dict__.items()
                  if k not in METADATA_FIELDS and k not in ('messages', 'tool_calls')
                  and not k.startswith('_')}
@@ -651,8 +713,10 @@ class Session:
 
     @classmethod
     def load(cls, sid):
-        # Validate session ID format to prevent path traversal
-        if not sid or not all(c in '0123456789abcdefghijklmnopqrstuvwxyz_' for c in sid):
+        # Validate session ID format to prevent path traversal.  API/gateway
+        # session ids may contain hyphens (for example ``api-*`` and
+        # ``reachy-voice-*``); allow those but still reject dots/slashes.
+        if not is_safe_session_id(sid):
             return None
         p = SESSION_DIR / f'{sid}.json'
         if not p.exists():
@@ -679,7 +743,9 @@ class Session:
         top-level "messages" field and synthesize a small metadata-only object.
         Falls back to load() for legacy or unexpected file layouts.
         """
-        if not sid or not all(c in '0123456789abcdefghijklmnopqrstuvwxyz_' for c in sid):
+        # Same path-safety contract as load(): hyphens are valid session ids,
+        # path separators and traversal dots are not.
+        if not is_safe_session_id(sid):
             return None
         p = SESSION_DIR / f'{sid}.json'
         if not p.exists():
@@ -1828,7 +1894,7 @@ def _repair_stale_pending(session) -> bool:
         _age = float('inf')
 
     sid = session.session_id
-    if not sid or not all(c in '0123456789abcdefghijklmnopqrstuvwxyz_' for c in sid):
+    if not is_safe_session_id(sid):
         return False
 
     try:
@@ -2156,6 +2222,70 @@ def _has_live_sidebar_state(session: dict) -> bool:
     )
 
 
+def _is_intentionally_background_sidebar_session(session: dict) -> bool:
+    sid = str(session.get('session_id') or '')
+    source = session.get('source_tag') or session.get('source')
+    return source == 'cron' or sid.startswith('cron_')
+
+
+def _preserve_messageful_sidebar_discoverability(
+    candidates: list[dict],
+    visible: list[dict],
+) -> list[dict]:
+    """Keep at least one messageful row per non-background conversation visible.
+
+    The normal sidebar filters intentionally hide empty drafts, cron/background
+    rows, and duplicate pre-compression snapshots. They must not make the only
+    messageful representative of a conversation disappear. If every visible row
+    for a lineage was filtered out, rescue the best hidden messageful row and
+    mark it so callers can surface or audit the degraded state.
+    """
+    sessions_by_id = {
+        str(session.get('session_id')): session
+        for session in candidates
+        if session.get('session_id')
+    }
+    covered_roots = {
+        _sidebar_lineage_root_id(session, sessions_by_id)
+        for session in visible
+        if _sidebar_message_count(session) > 0
+    }
+    visible_ids = {
+        str(session.get('session_id'))
+        for session in visible
+        if session.get('session_id')
+    }
+    rescue_by_root: dict[str, dict] = {}
+    for session in candidates:
+        sid = str(session.get('session_id') or '')
+        if not sid or sid in visible_ids:
+            continue
+        if _sidebar_message_count(session) <= 0:
+            continue
+        if _is_intentionally_background_sidebar_session(session):
+            continue
+        root = _sidebar_lineage_root_id(session, sessions_by_id)
+        if root in covered_roots:
+            continue
+        current = rescue_by_root.get(root)
+        if current is None or (
+            _sidebar_message_count(session), _session_sort_timestamp(session)
+        ) > (
+            _sidebar_message_count(current), _session_sort_timestamp(current)
+        ):
+            rescued = dict(session)
+            rescued['discoverability_warning'] = 'rescued_messageful_hidden_session'
+            rescue_by_root[root] = rescued
+    if not rescue_by_root:
+        return visible
+    rescued_rows = sorted(
+        rescue_by_root.values(),
+        key=lambda session: (session.get('pinned', False), _session_sort_timestamp(session)),
+        reverse=True,
+    )
+    return visible + rescued_rows
+
+
 def _prefer_fuller_snapshots_for_sidebar(sessions: list[dict]) -> list[dict]:
     """Expose a hidden snapshot when it is the fuller transcript for a lineage.
 
@@ -2273,7 +2403,18 @@ def _enrich_sidebar_lineage_metadata(sessions: list[dict]) -> None:
         if sid in metadata:
             entry = dict(metadata[sid])
             state_db_title = entry.pop('_state_db_title', None)
+            state_db_source = entry.pop('_state_db_source', None)
+            state_db_source_tag = entry.pop('_state_db_source_tag', None)
+            state_db_raw_source = entry.pop('_state_db_raw_source', None)
+            state_db_session_source = entry.pop('_state_db_session_source', None)
+            state_db_source_label = entry.pop('_state_db_source_label', None)
             session.update(entry)
+            if state_db_source == 'webui':
+                session['source_tag'] = state_db_source_tag
+                session['raw_source'] = state_db_raw_source
+                session['session_source'] = state_db_session_source
+                session['source_label'] = state_db_source_label
+                session['is_cli_session'] = False
             title = session.get('title')
             if (
                 state_db_title
@@ -2379,7 +2520,8 @@ def all_sessions(diag=None):
                 and not s.get('worktree_path')
             )]
             result = _prefer_fuller_snapshots_for_sidebar(result)
-            result = [s for s in result if not _hide_from_default_sidebar(s)]
+            visible_result = [s for s in result if not _hide_from_default_sidebar(s)]
+            result = _preserve_messageful_sidebar_discoverability(result, visible_result)
             _strip_sidebar_internal_flags(result)
             # Backfill: sessions created before Sprint 22 have no profile tag.
             # Attribute them to 'default' so the client profile filter works correctly.
@@ -2417,7 +2559,8 @@ def all_sessions(diag=None):
         and not getattr(s, 'worktree_path', None)
     )]
     result = _prefer_fuller_snapshots_for_sidebar(result)
-    result = [s for s in result if not _hide_from_default_sidebar(s)]
+    visible_result = [s for s in result if not _hide_from_default_sidebar(s)]
+    result = _preserve_messageful_sidebar_discoverability(result, visible_result)
     _strip_sidebar_internal_flags(result)
     for s in result:
         if not s.get('profile'):
@@ -3204,6 +3347,53 @@ def get_state_db_session_messages(sid, *, stitch_continuations: bool = False, pr
     return msgs
 
 
+def get_state_db_session_summary(sid, *, profile=None) -> dict:
+    """Return a cheap message count/timestamp summary for one state.db session."""
+    try:
+        import sqlite3
+    except ImportError:
+        return {"message_count": 0, "last_message_at": 0.0}
+
+    if isinstance(profile, str) and profile:
+        db_path = _get_profile_home(profile) / 'state.db'
+        if not db_path.exists():
+            db_path = _active_state_db_path()
+    else:
+        db_path = _active_state_db_path()
+    if not sid or not db_path.exists():
+        return {"message_count": 0, "last_message_at": 0.0}
+
+    try:
+        with closing(sqlite3.connect(str(db_path))) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            cur.execute("PRAGMA table_info(messages)")
+            available = {str(row['name']) for row in cur.fetchall()}
+            if 'session_id' not in available:
+                return {"message_count": 0, "last_message_at": 0.0}
+            if 'timestamp' in available:
+                cur.execute(
+                    "SELECT COUNT(*) AS message_count, MAX(timestamp) AS last_message_at "
+                    "FROM messages WHERE session_id = ?",
+                    (str(sid),),
+                )
+                row = cur.fetchone()
+                if not row:
+                    return {"message_count": 0, "last_message_at": 0.0}
+                return {
+                    "message_count": max(0, int(row["message_count"] or 0)),
+                    "last_message_at": float(row["last_message_at"] or 0) if row["last_message_at"] is not None else 0.0,
+                }
+            cur.execute("SELECT COUNT(*) AS message_count FROM messages WHERE session_id = ?", (str(sid),))
+            row = cur.fetchone()
+            return {
+                "message_count": max(0, int(row["message_count"] or 0)) if row else 0,
+                "last_message_at": 0.0,
+            }
+    except Exception:
+        return {"message_count": 0, "last_message_at": 0.0}
+
+
 def _normalized_message_timestamp_for_key(value):
     if value is None or value == "":
         return ""
@@ -3275,19 +3465,38 @@ def _session_message_visible_key(msg: dict):
     )
 
 
-def _matching_visible_duplicate(visible_key: tuple, visible_keys: set[tuple]):
+def _build_visible_duplicate_lookup(visible_keys: set[tuple]) -> dict:
+    by_role = {}
+    loose_by_key = {}
+    for key in visible_keys:
+        try:
+            role, content = key
+        except (TypeError, ValueError):
+            continue
+        if not content:
+            continue
+        by_role.setdefault(role, []).append(key)
+        loose_by_key[key] = _loose_session_message_content(content)
+    return {"keys": visible_keys, "by_role": by_role, "loose_by_key": loose_by_key}
+
+
+def _matching_visible_duplicate(visible_key: tuple, visible_keys: set[tuple], lookup: dict | None = None):
     if visible_key in visible_keys:
         return visible_key
     role, content = visible_key
     if not content:
         return None
-    for existing_role, existing_content in visible_keys:
+    if lookup is None:
+        lookup = _build_visible_duplicate_lookup(visible_keys)
+    loose_content = None
+    for existing_role, existing_content in lookup.get("by_role", {}).get(role, []):
         if role != existing_role or not existing_content:
             continue
         if content in existing_content or existing_content in content:
             return (existing_role, existing_content)
-        loose_content = _loose_session_message_content(content)
-        loose_existing = _loose_session_message_content(existing_content)
+        if loose_content is None:
+            loose_content = _loose_session_message_content(content)
+        loose_existing = lookup.get("loose_by_key", {}).get((existing_role, existing_content), "")
         if loose_content and loose_existing and (
             loose_content in loose_existing or loose_existing in loose_content
         ):
@@ -3393,6 +3602,7 @@ def merge_session_messages_append_only(
         sidecar_visible_counts[visible_key] = sidecar_visible_counts.get(visible_key, 0) + 1
         sidecar_visible_sequence.append(visible_key)
         merged_messages.append(msg)
+    sidecar_visible_lookup = _build_visible_duplicate_lookup(sidecar_visible_keys)
     state_replay_idx = 0
     skipped_state_visible_counts = {}
     for msg in state_messages:
@@ -3408,7 +3618,11 @@ def merge_session_messages_append_only(
                 replays_sidecar_prefix = True
                 state_replay_idx += 1
         if replays_sidecar_prefix:
-            matched_visible_key = _matching_visible_duplicate(visible_key, sidecar_visible_keys)
+            matched_visible_key = _matching_visible_duplicate(
+                visible_key,
+                sidecar_visible_keys,
+                sidecar_visible_lookup,
+            )
             if matched_visible_key is not None:
                 skipped_state_visible_counts[matched_visible_key] = (
                     skipped_state_visible_counts.get(matched_visible_key, 0) + 1
@@ -3428,7 +3642,11 @@ def merge_session_messages_append_only(
                 continue
         if key in seen_message_keys:
             continue
-        matched_visible_key = _matching_visible_duplicate(visible_key, sidecar_visible_keys)
+        matched_visible_key = _matching_visible_duplicate(
+            visible_key,
+            sidecar_visible_keys,
+            sidecar_visible_lookup,
+        )
         if matched_visible_key is not None:
             skipped_count = skipped_state_visible_counts.get(matched_visible_key, 0)
             sidecar_count = sidecar_visible_counts.get(matched_visible_key, 0)
