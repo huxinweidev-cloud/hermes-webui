@@ -3,6 +3,7 @@ async function api(path,opts={}){
   const rel = path.startsWith('/') ? path.slice(1) : path;
   const url=new URL(rel,document.baseURI||location.href);
   const timeoutMs=Object.prototype.hasOwnProperty.call(opts,'timeoutMs')?opts.timeoutMs:30000;
+  const timeoutToast=opts.timeoutToast!==false;
   // Retry up to 2 times on network errors (e.g. stale keep-alive after long idle).
   // Server errors (4xx/5xx) and client-side timeouts are NOT retried.
   let lastErr;
@@ -15,6 +16,8 @@ async function api(path,opts={}){
     try{
       const fetchOpts={...opts};
       delete fetchOpts.timeoutMs;
+      delete fetchOpts.timeoutToast;
+
       const useTimeout=Number.isFinite(Number(timeoutMs))&&Number(timeoutMs)>0;
       if(useTimeout&&typeof AbortController!=='undefined'){
         controller=new AbortController();
@@ -69,7 +72,7 @@ async function api(path,opts={}){
         const err=(e&&e.name==='TimeoutError')?e:new Error('Request timed out. Please try again.');
         err.name='TimeoutError';
         err.timeout=true;
-        if(typeof showToast==='function') showToast('Request timed out. Please try again.',5000,'error');
+        if(timeoutToast&&typeof showToast==='function') showToast('Request timed out. Please try again.',5000,'error');
         throw err;
       }
       // Only retry on network errors (TypeError from fetch), not on HTTP errors
@@ -98,7 +101,7 @@ function recordClientSSEError(source, details={}){
       url_path:(typeof location!=='undefined'&&location.pathname)||'/',
       reason:details.reason||'EventSource.onerror',
     };
-    void api('/api/client-events/log',{method:'POST',body:JSON.stringify(payload),timeoutMs:3000}).catch(()=>{});
+    void api('/api/client-events/log',{method:'POST',body:JSON.stringify(payload),timeoutMs:3000,timeoutToast:false}).catch(()=>{});
   }catch(_){}
 }
 
@@ -167,6 +170,12 @@ function _normalizeArtifactPath(path){
   if(!path) return '';
   path = String(path).trim().replace(/[\`"'<>),.;:]+$/g,'').replace(/^[\`"'(<]+/g,'');
   if(!path || path.length > 240 || path.includes('://')) return '';
+  // Canonicalize workspace-relative prefixes so a file-tree open ("foo.md") and a
+  // tool arg recorded as "./foo.md" or "~/foo.md" compare equal for mutation
+  // tracking; otherwise an agent edit via a ./-prefixed path leaves the open
+  // preview stale (#3262 / pre-release regression-gate finding).
+  path = path.replace(/^~\//,'').replace(/^(?:\.\/)+/,'');
+  if(!path) return '';
   if(ARTIFACT_IGNORE_RE.test(path)) return '';
   if(!/[./]/.test(path)) return '';
   return path;
@@ -218,6 +227,37 @@ function _artifactCandidatesFromToolCall(tc){
     for(const a of _artifactCandidatesFromText(argsText)) out.push(a);
   }
   return out;
+}
+
+const _turnMutatedPreviewPaths = new Set();
+
+function resetTurnWorkspaceMutations(){
+  _turnMutatedPreviewPaths.clear();
+}
+
+function noteWorkspaceMutationsFromToolCall(tc){
+  for(const a of _artifactCandidatesFromToolCall(tc)){
+    const path=_normalizeArtifactPath(a.path);
+    if(path) _turnMutatedPreviewPaths.add(path);
+  }
+}
+
+function noteWorkspaceMutationsFromToolCalls(toolCalls){
+  if(!Array.isArray(toolCalls)) return;
+  for(const tc of toolCalls) noteWorkspaceMutationsFromToolCall(tc);
+}
+
+function _isOpenPreviewPathMutated(){
+  if(!_previewCurrentPath) return false;
+  const current=_normalizeArtifactPath(_previewCurrentPath);
+  return !!(current&&_turnMutatedPreviewPaths.has(current));
+}
+
+async function refreshOpenPreviewIfMutated(){
+  if(typeof _previewDirty!=='undefined'&&_previewDirty) return;
+  if(!_isOpenPreviewPathMutated()) return;
+  if(!_previewCurrentPath||!S.session) return;
+  await openFile(_previewCurrentPath, { bustCache: true });
 }
 
 function collectSessionArtifacts(){
@@ -281,7 +321,8 @@ async function openArtifactPath(path){
   openFile(rel);
 }
 
-async function loadDir(path){
+async function loadDir(path, opts={}){
+  const preservePreview=!!(opts&&opts.preservePreview);
   if(!S.session)return;
   const sessionId=S.session.session_id;
   try{
@@ -311,12 +352,14 @@ async function loadDir(path){
       }
       if(expanded.size>0)renderFileTree();
     }
-    if(typeof clearPreview==='function'){
+    if(!preservePreview&&typeof clearPreview==='function'){
       if(typeof _previewDirty!=='undefined'&&_previewDirty){
         showConfirmDialog({title:t('unsaved_confirm'),message:'',confirmLabel:'Discard',danger:true,focusCancel:true}).then(ok=>{if(ok)clearPreview({keepPanelOpen:true});});
       }else{
         clearPreview({keepPanelOpen:true});
       }
+    }else if(preservePreview){
+      await refreshOpenPreviewIfMutated();
     }
     // Fetch git info for workspace root (non-blocking)
     if(!path||path==='.') _refreshGitBadge();
@@ -485,9 +528,11 @@ function cancelEditMode(){
   updateEditBtn();
 }
 
-async function openFile(path){
+async function openFile(path, opts={}){
   if(!S.session)return;
   const ext=fileExt(path);
+  const bustCache=!!(opts&&opts.bustCache);
+  const cacheBust=bustCache?`&_=${Date.now()}`:'';
 
   // Binary/download-only formats: trigger browser download, don't preview
   if(DOWNLOAD_EXTS.has(ext)){
@@ -504,14 +549,14 @@ async function openFile(path){
   if(IMAGE_EXTS.has(ext)){
     // Image: load via raw endpoint, show as <img>
     showPreview('image');
-    const url=`api/file/raw?session_id=${encodeURIComponent(S.session.session_id)}&path=${encodeURIComponent(path)}`;
+    const url=`api/file/raw?session_id=${encodeURIComponent(S.session.session_id)}&path=${encodeURIComponent(path)}${cacheBust}`;
     $('previewImg').alt=path;
     $('previewImg').src=url;
     $('previewImg').onerror=()=>setStatus(t('image_load_failed'));
   } else if(AUDIO_EXTS.has(ext)||VIDEO_EXTS.has(ext)){
     const mode=VIDEO_EXTS.has(ext)?'video':'audio';
     showPreview(mode);
-    const url=`api/file/raw?session_id=${encodeURIComponent(S.session.session_id)}&path=${encodeURIComponent(path)}&inline=1`;
+    const url=`api/file/raw?session_id=${encodeURIComponent(S.session.session_id)}&path=${encodeURIComponent(path)}&inline=1${cacheBust}`;
     const wrap=$('previewMediaWrap');
     if(wrap){
       wrap.innerHTML=(typeof _mediaPlayerHtml==='function')
@@ -521,7 +566,7 @@ async function openFile(path){
     }
   } else if(PDF_EXTS.has(ext)){
     showPreview('pdf');
-    const url=`api/file/raw?session_id=${encodeURIComponent(S.session.session_id)}&path=${encodeURIComponent(path)}&inline=1`;
+    const url=`api/file/raw?session_id=${encodeURIComponent(S.session.session_id)}&path=${encodeURIComponent(path)}&inline=1${cacheBust}`;
     const frame=$('previewPdfFrame');
     if(frame){
       frame.src=''; // clear first to avoid stale content
@@ -553,7 +598,7 @@ async function openFile(path){
     // or reading other origin data. If a stricter mode is needed, remove
     // allow-scripts (or add sandbox="") to disable all JS execution.
     showPreview('html');
-    const url=`api/file/raw?session_id=${encodeURIComponent(S.session.session_id)}&path=${encodeURIComponent(path)}&inline=1`;
+    const url=`api/file/raw?session_id=${encodeURIComponent(S.session.session_id)}&path=${encodeURIComponent(path)}&inline=1${cacheBust}`;
     const iframe=$('previewHtmlIframe');
     if(iframe){
       iframe.src=''; // clear first to avoid stale content
