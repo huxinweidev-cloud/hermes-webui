@@ -10,6 +10,7 @@ const ICONS={
   trash:'<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"><path d="M3.5 4.5h9M6.5 4.5V3h3v1.5M4.5 4.5v8.5h7v-8.5"/><line x1="7" y1="7" x2="7" y2="11"/><line x1="9" y1="7" x2="9" y2="11"/></svg>',
   more:'<svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor" stroke="none"><circle cx="8" cy="3" r="1.25"/><circle cx="8" cy="8" r="1.25"/><circle cx="8" cy="13" r="1.25"/></svg>',
   edit:'<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><path d="M11.5 2.5l2 2L5 13H3v-2z"/><path d="M10 4l2 2"/></svg>',
+  link:'<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><path d="M6.7 9.3a3 3 0 0 1 0-4.2l1.7-1.7a3 3 0 0 1 4.2 4.2l-1 1"/><path d="M9.3 6.7a3 3 0 0 1 0 4.2l-1.7 1.7a3 3 0 0 1-4.2-4.2l1-1"/></svg>',
 };
 
 // Tracks which session_id is currently being loaded. Used to discard stale
@@ -120,7 +121,7 @@ function _formatSessionModelWithGateway(s){
   if(!s||!s.model)return'';
   const routing=(typeof _latestGatewayRoutingForSession==='function')?_latestGatewayRoutingForSession(s):(s.gateway_routing||null);
   if(typeof _formatGatewayModelLabel==='function'){
-    return _formatGatewayModelLabel(s.model,s.model,routing)||s.model;
+    return _formatGatewayModelLabel(s.model,s.model,routing)||getModelLabel(s.model);
   }
   return s.model;
 }
@@ -361,7 +362,9 @@ function _markSessionCompletedInList(session, previousSid = null) {
   if (!session || !Array.isArray(_allSessions)) return;
   const finalSid = session.session_id || previousSid;
   if (!finalSid) return;
-  const idx = _allSessions.findIndex(s => s && (s.session_id === finalSid || s.session_id === previousSid));
+  const finalIdx = _allSessions.findIndex(s => s && s.session_id === finalSid);
+  const previousIdx = previousSid ? _allSessions.findIndex(s => s && s.session_id === previousSid) : -1;
+  const idx = finalIdx >= 0 ? finalIdx : previousIdx;
   if (idx < 0) return;
   const {messages: _messages, tool_calls: _toolCalls, ...sessionMeta} = session;
   const messageCount = Number(
@@ -384,6 +387,11 @@ function _markSessionCompletedInList(session, previousSid = null) {
   _sessionStreamingById.set(finalSid, false);
   _forgetObservedStreamingSession(finalSid);
   if (previousSid && previousSid !== finalSid) {
+    for (let i = _allSessions.length - 1; i >= 0; i--) {
+      if (i !== idx && _allSessions[i] && _allSessions[i].session_id === previousSid) {
+        _allSessions.splice(i, 1);
+      }
+    }
     _sessionStreamingById.delete(previousSid);
     _forgetObservedStreamingSession(previousSid);
     _sessionListSnapshotById.delete(previousSid);
@@ -1310,6 +1318,21 @@ let _messagesTruncated = false;
 // Older messages are loaded on-demand via _loadOlderMessages().
 const _INITIAL_MSG_LIMIT = 30;
 
+function _syncToolCallsForLoadedMessages(messages, sessionToolCalls){
+  const msgs=Array.isArray(messages)?messages:[];
+  const hasMessageToolMetadata=msgs.some(m=>{
+    if(!m) return false;
+    const hasTc=Array.isArray(m.tool_calls)&&m.tool_calls.length>0;
+    const hasTu=Array.isArray(m.content)&&m.content.some(p=>p&&p.type==='tool_use');
+    return hasTc||hasTu;
+  });
+  if(!hasMessageToolMetadata&&Array.isArray(sessionToolCalls)&&sessionToolCalls.length){
+    S.toolCalls=sessionToolCalls.map(tc=>({...tc,done:true}));
+  }else{
+    S.toolCalls=[];
+  }
+}
+
 async function _ensureMessagesLoaded(sid) {
   // Already have messages? (e.g. from INFLIGHT restore path, already set)
   if (S.messages && S.messages.length > 0 && S.messages[0] && S.messages[0].role) {
@@ -1327,17 +1350,7 @@ async function _ensureMessagesLoaded(sid) {
   // toast on every mobile message (SSE/visibility events trigger this reload path
   // more aggressively on mobile).
   let msgs = (data.session.messages || []).filter(m => m && m.role);
-  // Check for tool-call metadata on messages (for tool-call card rendering)
-  const hasMessageToolMetadata = msgs.some(m => {
-    const hasTc = Array.isArray(m.tool_calls) && m.tool_calls.length > 0;
-    const hasTu = Array.isArray(m.content) && m.content.some(p => p && p.type === 'tool_use');
-    return hasTc || hasTu;
-  });
-  if (!hasMessageToolMetadata && data.session.tool_calls && data.session.tool_calls.length) {
-    S.toolCalls = data.session.tool_calls.map(tc => ({...tc, done: true}));
-  } else {
-    S.toolCalls = [];
-  }
+  _syncToolCallsForLoadedMessages(msgs, data.session.tool_calls);
   clearLiveToolCards();
   // #3018: preserve client-side ephemeral turn fields (_turnUsage, _turnDuration,
   // _turnTps, _gatewayRouting, _statusCard) across the loadSession replace.
@@ -1500,6 +1513,7 @@ async function _loadOlderMessages() {
     const container = $('messages');
     const prevScrollH = container ? container.scrollHeight : 0;
     S.messages = nextMessages;
+    _syncToolCallsForLoadedMessages(nextMessages, responseSession.tool_calls);
     // renderMessages() windows long transcripts from the end. If we do not
     // expand that window before rendering, the newly prepended page stays
     // hidden and the "hidden" counter rises while the viewport appears stuck.
@@ -1584,6 +1598,7 @@ async function _ensureAllMessagesLoaded() {
     S.messages = msgs;
     _messagesTruncated = false;
     _oldestIdx = 0;
+    _syncToolCallsForLoadedMessages(msgs, data.session.tool_calls);
     if (S.session && S.session.session_id === sid) {
       S.session.message_count = Number(data.session.message_count || msgs.length);
     }
@@ -1593,6 +1608,8 @@ async function _ensureAllMessagesLoaded() {
 }
 
 let _allSessions = [];  // cached for search filter
+let _sessionAttentionSoundPrimed = false;
+const _sessionAttentionSoundState = new Map();
 let _renamingSid = null;  // session_id currently being renamed (blocks list re-renders)
 let _showArchived = false;  // toggle to show archived sessions
 let _sessionSelectMode = false;  // batch select mode
@@ -2003,6 +2020,77 @@ function _buildSessionAction(label, meta, icon, onSelect, extraClass=''){
   return opt;
 }
 
+function _sessionMarkdownLabel(session){
+  const sid=session&&session.session_id?String(session.session_id):'';
+  const title=String((session&&(session.title||session.name))||'Conversation').replace(/\s+/g,' ').trim()||'Conversation';
+  const shortSid=sid?sid.slice(0,12):'';
+  const label=shortSid?`${title} (${shortSid})`:title;
+  return label.replace(/([\\\[\]])/g,'\\$1').slice(0,120);
+}
+
+function _sessionMarkdownUrlSid(sid){
+  return encodeURIComponent(String(sid||'')).replace(/[()]/g, ch => ch==='('?'%28':'%29');
+}
+
+function _sessionInternalReferenceForSession(session){
+  const sid=session&&session.session_id;
+  if(!sid) return '';
+  return `[${_sessionMarkdownLabel(session)}](session://${_sessionMarkdownUrlSid(sid)})`;
+}
+
+async function _copyTextToClipboard(text){
+  if(navigator&&navigator.clipboard&&typeof navigator.clipboard.writeText==='function'){
+    await navigator.clipboard.writeText(text);
+    return true;
+  }
+  const ta=document.createElement('textarea');
+  ta.value=text;
+  ta.setAttribute('readonly','');
+  ta.style.position='fixed';
+  ta.style.left='-9999px';
+  ta.style.top='0';
+  document.body.appendChild(ta);
+  ta.select();
+  try{return document.execCommand('copy');}
+  finally{ta.remove();}
+}
+
+async function _copySessionLink(session){
+  const sid=session&&session.session_id;
+  if(!sid) return;
+  const ref=_sessionInternalReferenceForSession(session);
+  try{
+    await _copyTextToClipboard(ref);
+    showToast(t('session_link_copied'));
+  }catch(err){
+    showToast(t('session_link_copy_failed')+(err&&err.message?err.message:err));
+  }
+}
+
+function _mountSessionActionMenu(menu, session, anchorEl){
+  document.body.appendChild(menu);
+  _sessionActionMenu = menu;
+  _sessionActionAnchor = anchorEl;
+  _sessionActionSessionId = session.session_id;
+  if(anchorEl.classList&&anchorEl.classList.contains('session-actions-trigger')) anchorEl.classList.add('active');
+  const row=anchorEl.closest('.session-item');
+  if(row) row.classList.add('menu-open');
+  _positionSessionActionMenu(anchorEl);
+  _playSessionActionMenuEntrance(menu);
+}
+
+function _appendSessionCopyLinkAction(menu, session){
+  menu.appendChild(_buildSessionAction(
+    t('session_copy_link'),
+    t('session_copy_link_desc'),
+    ICONS.link,
+    async()=>{
+      closeSessionActionMenu();
+      await _copySessionLink(session);
+    }
+  ));
+}
+
 function _appendSessionDuplicateAction(menu, session){
   menu.appendChild(_buildSessionAction(
     t('session_duplicate'),
@@ -2063,7 +2151,7 @@ async function _archiveSession(session, archived=true, beforeListRender=null){
 }
 
 function _openSessionActionMenu(session, anchorEl){
-  if(_isReadOnlySession(session)){ if(typeof showToast==='function') showToast('Read-only imported sessions cannot be modified.',3000); return; }
+  const isReadOnly = _isReadOnlySession(session);
   if(_sessionActionMenu && _sessionActionSessionId===session.session_id && _sessionActionAnchor===anchorEl){
     closeSessionActionMenu();
     return;
@@ -2074,6 +2162,11 @@ function _openSessionActionMenu(session, anchorEl){
   const isExternalSession = isMessagingSession || isCliSession;
   const menu=document.createElement('div');
   menu.className='session-action-menu';
+  _appendSessionCopyLinkAction(menu, session);
+  if(isReadOnly){
+    _mountSessionActionMenu(menu, session, anchorEl);
+    return;
+  }
   // Rename — first menu item by request (#1764). Double-click rename is
   // timing-sensitive: the first click frequently registers as "open the
   // chat" before the second click arrives, so users open the conversation
@@ -2195,15 +2288,7 @@ function _openSessionActionMenu(session, anchorEl){
       'danger'
     ));
   }
-  document.body.appendChild(menu);
-  _sessionActionMenu = menu;
-  _sessionActionAnchor = anchorEl;
-  _sessionActionSessionId = session.session_id;
-  if(anchorEl.classList&&anchorEl.classList.contains('session-actions-trigger')) anchorEl.classList.add('active');
-  const row=anchorEl.closest('.session-item');
-  if(row) row.classList.add('menu-open');
-  _positionSessionActionMenu(anchorEl);
-  _playSessionActionMenuEntrance(menu);
+  _mountSessionActionMenu(menu, session, anchorEl);
 }
 
 document.addEventListener('click',e=>{
@@ -2347,6 +2432,42 @@ function _schedulePendingSessionListApply(){
   }, Math.max(120, SESSION_LIST_INTERACTION_IDLE_MS));
 }
 
+
+function _sessionAttentionSoundSignature(s){
+  const attention=s&&s.attention&&typeof s.attention==='object'?s.attention:null;
+  const count=Number(attention&&attention.count);
+  if(!attention||!attention.kind||!Number.isFinite(count)||count<=0)return null;
+  const kind=String(attention.kind)==='approval'?'approval':(String(attention.kind)==='clarify'?'clarify':'attention');
+  return `${kind}:${Math.max(1,count||1)}`;
+}
+
+function _syncSessionAttentionSoundState(sessions){
+  const next=new Map();
+  for(const s of Array.isArray(sessions)?sessions:[]){
+    if(!s||!s.session_id)continue;
+    const sig=_sessionAttentionSoundSignature(s);
+    if(sig) next.set(s.session_id,sig);
+  }
+  if(!_sessionAttentionSoundPrimed){
+    _sessionAttentionSoundPrimed=true;
+    _sessionAttentionSoundState.clear();
+    next.forEach((sig,sid)=>_sessionAttentionSoundState.set(sid,sig));
+    return;
+  }
+  next.forEach((sig,sid)=>{
+    const prev=_sessionAttentionSoundState.get(sid);
+    if(prev!==sig){
+      const [kind,countRaw]=String(sig).split(':');
+      const count=Number(countRaw)||1;
+      const s=(Array.isArray(sessions)?sessions:[]).find(item=>item&&item.session_id===sid)||{session_id:sid};
+      const playKey=typeof _attentionSoundKey==='function'?_attentionSoundKey(s.session_id,kind,count):`${s.session_id}:${sig}`;
+      if(playKey&&typeof playAttentionSound==='function') playAttentionSound(playKey);
+    }
+  });
+  _sessionAttentionSoundState.clear();
+  next.forEach((sig,sid)=>_sessionAttentionSoundState.set(sid,sig));
+}
+
 function _applySessionListPayload(sessData, projData){
   // Server's other_profile_count tells us how many sessions exist outside the
   // active profile so the "Show N from other profiles" toggle can render
@@ -2367,6 +2488,7 @@ function _applySessionListPayload(sessData, projData){
     : (sessData.sessions||[]);
   _reconcileActiveSessionIdleStateFromList(serverSessions);
   _allSessions = _mergeOptimisticFirstTurnSessions(serverSessions);
+  _syncSessionAttentionSoundState(_allSessions);
   _clearLineageReportCache();
   _allProjects = projData.projects||[];
   _markPollingCompletionUnreadTransitions(_allSessions);
@@ -2640,6 +2762,29 @@ function stopGatewayPollFallback(){
   }
 }
 
+function _gatewaySessionSnapshotKey(sessions){
+  return (Array.isArray(sessions)?sessions:[])
+    .filter(s=>s&&s.session_id)
+    .map(s=>`${s.session_id}:${s.updated_at||0}:${s.message_count||0}`)
+    .sort()
+    .join('|');
+}
+
+function _isGatewaySessionForSnapshot(session){
+  if(!session) return false;
+  if(typeof _isCliSession==='function'&&_isCliSession(session)) return true;
+  if(typeof _isMessagingSession==='function'&&_isMessagingSession(session)) return true;
+  const source=String(session.session_source||session.raw_source||session.source_tag||session.source||'').toLowerCase();
+  return !!source&&source!=='webui';
+}
+
+function _isDuplicateGatewaySessionSnapshot(sessions){
+  const incoming=(Array.isArray(sessions)?sessions:[]).filter(_isGatewaySessionForSnapshot);
+  const currentGatewaySessions=(Array.isArray(_allSessions)?_allSessions:[]).filter(_isGatewaySessionForSnapshot);
+  if(!incoming.length&&!currentGatewaySessions.length) return true;
+  return _gatewaySessionSnapshotKey(incoming)===_gatewaySessionSnapshotKey(currentGatewaySessions);
+}
+
 async function probeGatewaySSEStatus(){
   if(_gatewayProbeInFlight || !window._showCliSessions) return;
   _gatewayProbeInFlight = true;
@@ -2681,7 +2826,9 @@ function startGatewaySSE(){
         if(data.sessions){
           stopGatewayPollFallback();
           _gatewaySSEWarningShown = false;
-          renderSessionList({deferWhileInteracting:true}); // re-fetch and re-render
+          if(!_isDuplicateGatewaySessionSnapshot(data.sessions)){
+            renderSessionList({deferWhileInteracting:true}); // re-fetch and re-render
+          }
           // If the active session received new gateway messages, refresh the conversation view.
           // S.busy check prevents stomping on an in-progress WebUI response.
           // is_cli_session check ensures we only poll import_cli for CLI-originated sessions.
@@ -2700,8 +2847,17 @@ function startGatewaySSE(){
                     if (next.length < prev) return;
                     if (prev > 0 && !_isCliImportRefreshPrefixMatch(S.messages, next)) return;
                     S.messages = next;
+                    if(S.session && S.session.session_id === activeSid){
+                      S.session.message_count = next.length;
+                      const newest = next.length ? next[next.length - 1] : null;
+                      const newestTs = Number((newest && (newest.timestamp || newest._ts)) || 0);
+                      if(newestTs){
+                        S.session.last_message_at = newestTs;
+                        S.session.updated_at = newestTs;
+                      }
+                    }
                     if(S.messages.length !== prev){
-                      renderMessages();
+                      renderMessages({preserveScroll:true});
                       if(typeof highlightCode==='function') highlightCode();
                     }
                   }
@@ -2799,6 +2955,91 @@ function _sessionSearchContentPreview(session, query){
   return preview||'';
 }
 
+function _sessionSearchAddIdCandidate(candidates, seen, value){
+  const raw=String(value||'').trim();
+  if(!raw) return;
+  const add=(candidate)=>{
+    const sid=String(candidate||'').trim();
+    if(!sid||seen.has(sid)) return;
+    seen.add(sid);
+    candidates.push(sid);
+  };
+  add(raw);
+  try{add(decodeURIComponent(raw));}catch(_e){}
+}
+
+function _sessionSearchCleanUrlToken(token){
+  let value=String(token||'').trim();
+  value=value.replace(/[\],.;]+$/g,'');
+  while(value.endsWith(')')&&value.indexOf('(')<0) value=value.slice(0,-1);
+  return value;
+}
+
+function _sessionSearchSessionIdCandidates(query){
+  const source=String(query||'').trim();
+  const candidates=[];
+  const seen=new Set();
+  if(!source) return candidates;
+  _sessionSearchAddIdCandidate(candidates,seen,source);
+
+  const inspectUrl=(token)=>{
+    const cleaned=_sessionSearchCleanUrlToken(token);
+    if(!cleaned) return;
+    try{
+      const url=new URL(cleaned,'http://webui.local');
+      const parts=url.pathname.split('/').filter(Boolean);
+      const sessionIdx=parts.findIndex(p=>p.toLowerCase()==='session');
+      if(sessionIdx>=0&&parts[sessionIdx+1]) _sessionSearchAddIdCandidate(candidates,seen,parts[sessionIdx+1]);
+      for(const key of ['session_id','session','sid']){
+        const value=url.searchParams.get(key);
+        if(value) _sessionSearchAddIdCandidate(candidates,seen,value);
+      }
+    }catch(_e){}
+  };
+
+  const markdownLinkRe=/\]\(([^\s)]+)\)/g;
+  let match;
+  while((match=markdownLinkRe.exec(source))) inspectUrl(match[1]);
+
+  const sessionSchemeRe=/session:\/\/([^\s)>\]]+)/gi;
+  while((match=sessionSchemeRe.exec(source))) _sessionSearchAddIdCandidate(candidates,seen,match[1]);
+
+  const urlRe=/(?:https?:\/\/[^\s<>\]]+|\/session\/[^\s<>\]]+|\?[^\s<>\]]+)/gi;
+  while((match=urlRe.exec(source))) inspectUrl(match[0]);
+
+  const queryParamRe=/(?:^|[?&\s])(session_id|session|sid)=([^&#\s)]+)/gi;
+  while((match=queryParamRe.exec(source))) _sessionSearchAddIdCandidate(candidates,seen,match[2]);
+  return candidates;
+}
+
+function _sessionSearchDirectSessionMatches(sessions, query){
+  const candidates=_sessionSearchSessionIdCandidates(query);
+  if(!candidates.length) return [];
+  const candidateIds=new Set(candidates.map(s=>String(s)));
+  return (sessions||[]).filter(s=>s&&candidateIds.has(String(s.session_id||'')));
+}
+
+function _sessionSearchDirectAndTitleMatches(sessions, query){
+  const source=String(query||'').trim();
+  if(!source) return sessions||[];
+  const q=source.toLowerCase();
+  const titleMatches=(sessions||[]).filter(s=>_sessionDisplayTitle(s).toLowerCase().includes(q));
+  const directSessionMatches=_sessionSearchDirectSessionMatches(sessions,source);
+  const directSessionIds=new Set(directSessionMatches.map(s=>s.session_id));
+  return [...directSessionMatches,...titleMatches.filter(s=>!directSessionIds.has(s.session_id))];
+}
+
+function _sessionSearchMergeMatches(sessions, query, contentResults){
+  const source=String(query||'').trim();
+  if(!source) return sessions||[];
+  const directAndTitleMatches=_sessionSearchDirectAndTitleMatches(sessions,source);
+  const directOrTitleIds=new Set(directAndTitleMatches.map(s=>s.session_id));
+  return [
+    ...directAndTitleMatches,
+    ...(contentResults||[]).filter(s=>s&&s.match_type==='content'&&!directOrTitleIds.has(s.session_id))
+  ];
+}
+
 function syncSessionSearchClear(){
   const input=$('sessionSearch');
   const clear=$('sessionSearchClear');
@@ -2836,8 +3077,9 @@ function filterSessions(){
       const data = await api(`/api/sessions/search?q=${encodeURIComponent(requestedQ)}&content=1&depth=5`);
       const currentQ = ($('sessionSearch').value || '').trim();
       if(currentQ!==requestedQ) return;
-      const titleIds = new Set(_allSessions.filter(s => _sessionDisplayTitle(s).toLowerCase().includes(q.toLowerCase())).map(s=>s.session_id));
-      _contentSearchResults = (data.sessions||[]).filter(s => s.match_type === 'content' && !titleIds.has(s.session_id));
+      const directAndTitleMatches=_sessionSearchDirectAndTitleMatches(_allSessions,currentQ);
+      const directOrTitleIds=new Set(directAndTitleMatches.map(s=>s.session_id));
+      _contentSearchResults = (data.sessions||[]).filter(s => s.match_type === 'content' && !directOrTitleIds.has(s.session_id));
       renderSessionListFromCache();
     } catch(e) { /* ignore */ }
   }, 350);
@@ -3129,6 +3371,45 @@ function _sessionTitleForForkParent(parentSid){
   const title=parent&&String(parent.title||'').trim();
   if(!title||title==='Untitled') return '';
   return title;
+}
+
+function _sessionFullTitleTooltip(rawTitle, cleanTitle, session){
+  const fallback=String(cleanTitle||'Untitled').trim()||'Untitled';
+  const full=String(rawTitle||fallback).trim()||fallback;
+  const title=full.startsWith('[SYSTEM:') ? fallback : full;
+  if(typeof t==='function'&&_isReadOnlySession(session)) return t('session_readonly_title_hint', title);
+  return title;
+}
+
+function _sessionForkTooltip(parentLabel){
+  const parent=String(parentLabel||'').trim()||'unknown parent';
+  // Preserve the localized "Forked from" base (the catalog key exists in all
+  // locales) rather than hardcoding English — the only regression risk in the
+  // tooltip rework was dropping t('forked_from') here.
+  const prefix=(typeof t==='function'?t('forked_from'):'Forked from');
+  return `${prefix}: ${parent}`;
+}
+
+function _sessionLineageBadgeTooltip(label, canExpand){
+  const base=String(label||'Prior turns').trim()||'Prior turns';
+  if(typeof t==='function'){
+    return canExpand
+      ? t('session_lineage_toggle_hint', base)
+      : t('session_lineage_static_hint', base);
+  }
+  return base;
+}
+
+function _sessionChildBadgeTooltip(label){
+  const base=String(label||'Child sessions').trim()||'Child sessions';
+  if(typeof t==='function') return t('session_child_toggle_hint', base);
+  return base;
+}
+
+function _sessionStateTooltip({isStreaming=false,hasUnread=false}={}){
+  if(isStreaming) return 'Conversation is running';
+  if(hasUnread) return 'Unread completion';
+  return '';
 }
 
 function _attachChildSessionsToSidebarRows(collapsedRows, rawSessions){
@@ -3435,16 +3716,17 @@ function renderSessionListFromCache(){
   const searchQueryRaw=($('sessionSearch').value||'').trim();
   const q=searchQueryRaw.toLowerCase();
   const activeSidForSidebar=_activeSessionIdForSidebar();
-  const titleMatches=q?_allSessions.filter(s=>_sessionDisplayTitle(s).toLowerCase().includes(q)):_allSessions;
-  // Merge content matches (deduped): content matches appended after title matches
-  const titleIds=new Set(titleMatches.map(s=>s.session_id));
-  const allMatched=q?[...titleMatches,..._contentSearchResults.filter(s=>!titleIds.has(s.session_id))]:titleMatches;
+  // Merge direct session-id/link matches, title matches, then content matches (deduped).
+  // Direct matches must not disable content search: if a user pasted the same
+  // session id into another conversation, that content hit should still appear.
+  const allMatched=_sessionSearchMergeMatches(_allSessions,searchQueryRaw,_contentSearchResults);
   // Never surface ephemeral 0-message sessions in the sidebar — they only become
   // real once the first message is sent. The server already filters them, but this
   // guard ensures a brand-new active session doesn't flash into the list while
   // _allSessions is stale from a prior render (#1171).
   const withMessages=allMatched.filter(s=>
     (s.message_count||0)>0 ||
+    _sessionAttentionState(s) ||
     _isSessionEffectivelyStreaming(s) ||
     !!s.active_stream_id ||
     !!s.pending_user_message ||
@@ -3755,6 +4037,20 @@ function renderSessionListFromCache(){
   _pendingSessionReflowPositions=null;
   _playSessionRowsReflowFromPositions(reflowBefore,reflowTimeout,_sessionPrefersReducedMotion);
   // Note: declared after the groups loop but available via function hoisting.
+  function _sessionAttentionState(s){
+    const attention=s&&s.attention&&typeof s.attention==='object'?s.attention:null;
+    if(!attention||!attention.kind||!Number.isFinite(Number(attention.count))||Number(attention.count)<=0)return null;
+    const kind=String(attention.kind)==='approval'?'approval':(String(attention.kind)==='clarify'?'clarify':'attention');
+    const count=Math.max(1,Number(attention.count)||1);
+    const labelKey=kind==='approval'?'session_attention_approval':(kind==='clarify'?'session_attention_clarify':'session_attention_generic');
+    const titleKey=kind==='approval'?'session_attention_approval_title':(kind==='clarify'?'session_attention_clarify_title':'session_attention_generic_title');
+    const fallback=kind==='approval'?(count===1?'Approval':`${count} approvals`):(kind==='clarify'?(count===1?'Question':`${count} questions`):(count===1?'Attention':`${count} items`));
+    const titleFallback=kind==='approval'?'Waiting for permission decision':(kind==='clarify'?'Waiting for your answer':'Waiting for user action');
+    const label=(typeof t==='function')?t(labelKey,count):fallback;
+    const title=(typeof t==='function')?t(titleKey,count):titleFallback;
+    return {kind,count,severity:String(attention.severity||''),label,title};
+  }
+
   function _renderOneSession(s, isPinnedGroup=false){
     const el=document.createElement('div');
     const isActive=_sessionLineageContainsSession(s,activeSidForSidebar);
@@ -3762,8 +4058,10 @@ function renderSessionListFromCache(){
     _rememberRenderedStreamingState(s, isStreaming);
     _rememberRenderedSessionSnapshot(s);
     const hasUnread=_hasUnreadForSession(s)&&!isActive;
+    const attention=_sessionAttentionState(s);
+    const attentionClass=attention?(attention.kind==='approval'?' attention-approval':(attention.kind==='clarify'?' attention-clarify':' attention-attention')):'';
     const readOnly=_isReadOnlySession(s);
-    el.className='session-item'+(isActive?' active':'')+(isActive&&S.session&&S.session._flash?' new-flash':'')+(s.archived?' archived':'')+(isStreaming?' streaming':'')+(hasUnread?' unread':'');
+    el.className='session-item'+(isActive?' active':'')+(isActive&&S.session&&S.session._flash?' new-flash':'')+(s.archived?' archived':'')+(isStreaming?' streaming':'')+(hasUnread?' unread':'')+(attention?' needs-attention':'')+attentionClass;
     const swipeReturnOffset=_sessionSwipeReturnOffsets.get(s.session_id);
     if(swipeReturnOffset!==undefined){
       _sessionSwipeReturnOffsets.delete(s.session_id);
@@ -3829,7 +4127,7 @@ function renderSessionListFromCache(){
       branchInd.className='session-branch-indicator';
       branchInd.innerHTML=li('git-branch',12);
       const parentLabel=_sessionTitleForForkParent(s.parent_session_id)||_truncatedSessionId(s.parent_session_id);
-      branchInd.title=(typeof t==='function'?t('forked_from'):'Forked from')+' '+parentLabel;
+      branchInd.title=_sessionForkTooltip(parentLabel);
       titleRow.appendChild(branchInd);
     }
     const title=document.createElement('span');
@@ -3838,10 +4136,10 @@ function renderSessionListFromCache(){
     const titleMatched=Boolean(searchQueryRaw&&displayTitle.toLowerCase().includes(searchQueryRaw.toLowerCase()));
     if(titleMatched) _appendHighlightedText(title,displayTitle,searchQueryRaw,'session-search-hit');
     else title.textContent=displayTitle;
-    title.title=readOnly?'Read-only imported session':'Double-click to rename';
+    title.title=_sessionFullTitleTooltip(rawTitle,cleanTitle,s);
     const tsMs=_sessionTimestampMs(s);
     const ts=document.createElement('span');
-    const hasAttentionState=isStreaming||hasUnread;
+    const hasAttentionState=isStreaming||hasUnread||Boolean(attention);
     ts.className='session-time'+(hasAttentionState?' is-hidden':'');
     ts.textContent=hasAttentionState?'':_formatRelativeSessionTime(tsMs);
     titleRow.appendChild(title);
@@ -3874,7 +4172,7 @@ function renderSessionListFromCache(){
       segmentCountEl.className='session-lineage-count'+(canExpandLineageSegments?' expandable':'');
       const segmentLabel=t('session_meta_segments', segmentCount);
       segmentCountEl.textContent=segmentLabel;
-      segmentCountEl.title=segmentLabel;
+      segmentCountEl.title=_sessionLineageBadgeTooltip(segmentLabel,canExpandLineageSegments);
       if(canExpandLineageSegments){
         segmentCountEl.setAttribute('role','button');
         segmentCountEl.setAttribute('tabindex','0');
@@ -3903,7 +4201,7 @@ function renderSessionListFromCache(){
       childCountEl.className='session-child-count';
       const childLabel=t('session_meta_children', childCount);
       childCountEl.textContent=childLabel;
-      childCountEl.title=childLabel;
+      childCountEl.title=_sessionChildBadgeTooltip(childLabel);
       ['pointerdown','pointerup','click'].forEach(ev=>childCountEl.addEventListener(ev,e=>e.stopPropagation()));
       childCountEl.onclick=(e)=>{
         e.stopPropagation();
@@ -4088,8 +4386,17 @@ function renderSessionListFromCache(){
     // sits outside the truncating title span and stays visible.)
     el.appendChild(sessionText);
     const state=document.createElement('span');
-    state.className='session-attention-indicator session-state-indicator'+(isStreaming?' is-streaming':(hasUnread?' is-unread':''));
+    const attentionDotClass=attention?(attention.kind==='approval'?' is-attention-approval':(attention.kind==='clarify'?' is-attention-clarify':' is-attention-generic')):'';
+    state.className='session-attention-indicator session-state-indicator'+(isStreaming?' is-streaming':(hasUnread?' is-unread':''))+attentionDotClass;
     state.setAttribute('aria-hidden','true');
+    // Tooltip precedence: a localized attention title (pending approval/clarify,
+    // from the attention-indicator feature) is more specific and actionable than
+    // the generic running/unread state tooltip, so it wins. Fall back to the state
+    // tooltip only when there is no attention title AND the state tooltip is
+    // non-empty — never blank an otherwise-meaningful tooltip.
+    const _stateTip=_sessionStateTooltip({isStreaming,hasUnread});
+    if(attention&&attention.title) state.title=attention.title;
+    else if(_stateTip) state.title=_stateTip;
     el.appendChild(state);
     // Single trigger button that opens a shared dropdown menu
     let actions=null;

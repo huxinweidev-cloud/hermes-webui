@@ -40,19 +40,6 @@ from api.session_events import (
 
 logger = logging.getLogger(__name__)
 
-# Treat stalled/closed HTTP clients as normal disconnects.  Long-lived SSE
-# connections often end this way when a browser tab sleeps, a phone switches
-# networks, or Tailscale leaves the socket half-closed.  If these bubble to the
-# request handler, the server logs 500s and can leave CLOSE-WAIT sockets around
-# until the OS-level timeout fires.
-_CLIENT_DISCONNECT_ERRORS = (
-    BrokenPipeError,
-    ConnectionResetError,
-    ConnectionAbortedError,
-    TimeoutError,
-    OSError,
-)
-
 # ── Cron run tracking ────────────────────────────────────────────────────────
 # Track job IDs currently being executed so the frontend can poll status.
 _RUNNING_CRON_JOBS: dict[str, float] = {}  # job_id → start_timestamp
@@ -97,6 +84,25 @@ def _session_field(session, field, default=None):
     if isinstance(session, dict):
         return session.get(field, default)
     return getattr(session, field, default)
+
+
+def _session_counts_toward_pin_quota(session) -> bool:
+    """Return True when a pinned session should consume visible pin quota."""
+    if not _session_field(session, "pinned", False):
+        return False
+    if _session_field(session, "archived", False):
+        return False
+    if isinstance(session, dict):
+        row = session
+    elif hasattr(session, "compact"):
+        row = session.compact()
+    else:
+        row = {
+            "pre_compression_snapshot": _session_field(session, "pre_compression_snapshot", False),
+            "source_tag": _session_field(session, "source_tag", None),
+            "default_hidden": _session_field(session, "default_hidden", False),
+        }
+    return not _hide_from_default_sidebar(row)
 
 
 # ── Profile-scoped session/project filtering (#1611, #1614) ────────────────
@@ -906,7 +912,7 @@ def _run_cron_tracked(job, profile_home=None, execution_profile_home=None):
     except Exception as e:
         logger.exception("Manual cron run failed for job %s", job_id)
         try:
-            _with_cron_home(profile_home, lambda: mark_job_run(job_id, False, str(e)))
+            _with_cron_home(profile_home, lambda: mark_job_run(job_id, False, str(e)))  # noqa: F821  e is bound by the enclosing `except ... as e` and the lambda runs synchronously here
         except Exception:
             logger.debug("Failed to mark manual cron run failure for %s", job_id)
     finally:
@@ -1035,6 +1041,7 @@ from api.helpers import (
     _sanitize_error,
     redact_session_data,
     _redact_text,
+    _CLIENT_DISCONNECT_ERRORS,
 )
 from api.agent_health import build_agent_health_payload
 from api.gateway_chat import gateway_chat_config_status
@@ -2257,7 +2264,13 @@ def _messages_include_tool_metadata(messages) -> bool:
 
 
 def _tool_calls_for_message_window(tool_calls, start_idx: int, message_count: int) -> list:
-    """Keep session-level tool calls that point into a returned message window."""
+    """Keep session-level tool calls that point into a returned message window.
+
+    ``assistant_msg_idx`` is stored in the full transcript coordinate space, but
+    the frontend renders the returned ``messages`` array from index 0. Rebase the
+    index into the returned window so legacy session-level tool cards still
+    anchor to their visible assistant turn after paginated loads.
+    """
     if not isinstance(tool_calls, list) or message_count <= 0:
         return []
     end_idx = start_idx + message_count
@@ -2269,7 +2282,9 @@ def _tool_calls_for_message_window(tool_calls, start_idx: int, message_count: in
         if isinstance(assistant_idx, bool) or not isinstance(assistant_idx, int):
             continue
         if start_idx <= assistant_idx < end_idx:
-            filtered.append(tool_call)
+            rebased = dict(tool_call)
+            rebased["assistant_msg_idx"] = assistant_idx - start_idx
+            filtered.append(rebased)
     return filtered
 
 
@@ -2730,6 +2745,7 @@ from api.models import (
     merge_session_messages_append_only,
     _session_message_merge_key,
     _is_empty_partial_activity_message,
+    _hide_from_default_sidebar,
     prune_session_from_index,
     ensure_cron_project,
     is_cron_session,
@@ -2896,6 +2912,7 @@ def submit_pending(session_key: str, approval: dict) -> None:
         # submit_pending calls can't deliver out-of-order (T2's later
         # notify arriving before T1's earlier notify with a stale count).
         _approval_sse_notify_locked(session_key, head, total)
+    publish_session_list_changed("attention_pending")
     # NOTE: We do NOT call _submit_pending_raw here — that function overwrites
     # _pending[session_key] with a single dict, which would undo the list we just
     # built. The gateway blocking path uses _gateway_queues (a separate mechanism
@@ -2907,6 +2924,7 @@ try:
     from api.clarify import (
         submit_pending as submit_clarify_pending,
         get_pending as get_clarify_pending,
+        pending_count as get_clarify_pending_count,
         resolve_clarify,
         resolve_clarify_by_id,
         sse_subscribe as clarify_sse_subscribe,
@@ -2915,9 +2933,36 @@ try:
 except ImportError:
     submit_clarify_pending = lambda *a, **k: None
     get_clarify_pending = lambda *a, **k: None
+    get_clarify_pending_count = lambda *a, **k: 0
     clarify_sse_subscribe = None
     resolve_clarify = lambda *a, **k: 0
     resolve_clarify_by_id = lambda *a, **k: False
+
+
+def _session_attention_summary(session_id: str) -> dict | None:
+    """Return sidebar attention metadata for pending approval/clarify work."""
+    approval_count = 0
+    with _lock:
+        queue_list = _pending.get(session_id)
+        if isinstance(queue_list, list):
+            approval_count = len(queue_list)
+        elif queue_list:
+            approval_count = 1
+    if approval_count > 0:
+        return {
+            "kind": "approval",
+            "count": approval_count,
+            "severity": "critical",
+        }
+
+    clarify_count = int(get_clarify_pending_count(session_id) or 0)
+    if clarify_count > 0:
+        return {
+            "kind": "clarify",
+            "count": clarify_count,
+            "severity": "question",
+        }
+    return None
 
 
 # ── Login page locale strings ─────────────────────────────────────────────────
@@ -3510,6 +3555,63 @@ def _handle_insights(handler, parsed) -> bool:
                 hod_activity[dt.tm_hour] += 1
             except Exception:
                 pass
+
+    # ── Also include CLI sessions from Hermes state.db ─────────────────────
+    try:
+        from api.models import _active_state_db_path
+        db_path = _active_state_db_path()
+        if db_path and db_path.exists():
+            with closing(sqlite3.connect(str(db_path))) as conn:
+                conn.row_factory = sqlite3.Row
+                cur = conn.cursor()
+                cur.execute("""
+                    SELECT id, model, message_count, input_tokens, output_tokens,
+                           estimated_cost_usd, started_at, ended_at
+                    FROM sessions
+                    WHERE (started_at >= ? OR ended_at >= ?)
+                      AND COALESCE(source, '') != 'webui'
+                """, (cutoff, cutoff))
+                for row in cur.fetchall():
+                    _input = _safe_usage_int(row["input_tokens"])
+                    _output = _safe_usage_int(row["output_tokens"])
+                    _cost = _safe_cost_float(row["estimated_cost_usd"])
+                    _msgs = _safe_usage_int(row["message_count"])
+                    total_sessions += 1
+                    total_messages += _msgs
+                    total_input_tokens += _input
+                    total_output_tokens += _output
+                    total_cost += _cost
+
+                    _model = row["model"] or "unknown"
+                    bucket = model_stats.setdefault(_model, {
+                        "sessions": 0,
+                        "input_tokens": 0,
+                        "output_tokens": 0,
+                        "cost": 0.0,
+                    })
+                    bucket["sessions"] += 1
+                    bucket["input_tokens"] += _input
+                    bucket["output_tokens"] += _output
+                    bucket["cost"] += _cost
+
+                    _ts = row["started_at"] or row["ended_at"] or 0
+                    if _ts:
+                        _dt = _time.localtime(_ts)
+                        _day_key = _time.strftime("%Y-%m-%d", _dt)
+                        _daily = daily_tokens.setdefault(_day_key, {
+                            "input_tokens": 0,
+                            "output_tokens": 0,
+                            "sessions": 0,
+                            "cost": 0.0,
+                        })
+                        _daily["input_tokens"] += _input
+                        _daily["output_tokens"] += _output
+                        _daily["sessions"] += 1
+                        _daily["cost"] += _cost
+                        dow_activity[_dt.tm_wday] += 1
+                        hod_activity[_dt.tm_hour] += 1
+    except Exception:
+        logger.debug("Failed to include CLI sessions in insights", exc_info=True)
 
     # Build model breakdown
     total_tokens = total_input_tokens + total_output_tokens
@@ -4720,6 +4822,7 @@ def handle_get(handler, parsed) -> bool:
                 item = dict(s)
                 if isinstance(item.get("title"), str):
                     item["title"] = _redact_text(item["title"])
+                item["attention"] = _session_attention_summary(str(item.get("session_id") or ""))
                 safe_merged.append(item)
             diag.stage("response_write")
             return j(handler, {
@@ -5144,9 +5247,29 @@ def handle_get(handler, parsed) -> bool:
         elif alive is False:
             running = False
             configured = True
-        else:  # alive is None → gateway not configured / unavailable
+        else:  # alive is None
+            # `alive is None` conflates two very different states:
+            #   (a) no gateway metadata at all → genuinely not configured
+            #   (b) gateway metadata EXISTS but is stale/inconclusive.
+            # A stale-but-RUNNING gateway (freshly started, hasn't ticked
+            # `updated_at` yet, or cross-container) still proves the gateway is
+            # *configured* — the banner must not report "Gateway not configured"
+            # just because no conversation has happened yet and identity_map is
+            # empty (#3194).
+            #
+            # A stale-STOPPED gateway is deliberately NOT treated as configured:
+            # agent_health emits `gateway_stale_stopped_state` precisely so a
+            # stopped service the user isn't running reads like "no root gateway
+            # configured" rather than nagging (#1944). So stale-stopped falls
+            # through to the identity_map signal like the genuinely-unconfigured
+            # case.
+            details = health.get("details") or {}
+            gateway_running_metadata = (
+                details.get("reason") == "gateway_stale_running_state"
+                or details.get("gateway_state") == "running"
+            )
+            configured = True if gateway_running_metadata else bool(identity_map)
             running = bool(identity_map)
-            configured = bool(identity_map)
 
         platforms_set: set[str] = set()
         for meta in identity_map.values():
@@ -6509,7 +6632,7 @@ def handle_post(handler, parsed) -> bool:
             # so must run outside our own LOCK acquire below).
             persisted_pinned_ids = {
                 _session_field(existing, "session_id", None) for existing in all_sessions()
-                if _session_field(existing, "pinned", False) and not _session_field(existing, "archived", False)
+                if _session_counts_toward_pin_quota(existing)
             }
             with LOCK:
                 # Final authoritative count: merge persisted-pinned with the
@@ -6519,7 +6642,7 @@ def handle_post(handler, parsed) -> bool:
                 pinned_ids = set(persisted_pinned_ids)
                 pinned_ids.update(
                     sid for sid, existing in SESSIONS.items()
-                    if getattr(existing, "pinned", False) and not getattr(existing, "archived", False)
+                    if _session_counts_toward_pin_quota(existing)
                 )
                 pinned_ids.discard(body["session_id"])
                 pinned_sessions_limit = int(load_settings().get("pinned_sessions_limit", 3) or 3)
@@ -7378,11 +7501,106 @@ def _replay_run_journal(handler, stream_id: str, after_seq: int | None) -> bool:
     return True
 
 
+def _runner_stream_cursor_from_query(qs: dict) -> str | None:
+    cursor = str(qs.get("cursor", [""])[0] or "").strip()
+    if cursor:
+        return cursor
+    after_seq = _parse_run_journal_after_seq(qs)
+    return str(after_seq) if after_seq is not None else None
+
+
+def _runner_event_name(entry: dict) -> str:
+    return str(entry.get("event") or entry.get("type") or "message")
+
+
+def _runner_event_payload(entry: dict):
+    if "payload" in entry:
+        return entry.get("payload")
+    if "data" in entry:
+        return entry.get("data")
+    return entry
+
+
+def _runner_event_id(run_id: str, entry: dict) -> str | None:
+    event_id = entry.get("event_id") or entry.get("id")
+    if event_id:
+        return str(event_id)
+    seq = entry.get("seq")
+    if seq not in (None, ""):
+        return f"{run_id}:{seq}"
+    return None
+
+
+def _stream_runner_run_events(handler, run_id: str, cursor: str | None = None) -> bool:
+    """Stream events from a configured runner without WebUI-owned runtime maps."""
+    run_id = str(run_id or "").strip()
+    if not run_id:
+        return False
+    try:
+        from api.runtime_adapter import build_runtime_adapter, runtime_adapter_runner_enabled
+
+        if not runtime_adapter_runner_enabled():
+            return False
+        adapter = build_runtime_adapter(runner_client_factory=_runtime_runner_client_factory)
+    except NotImplementedError:
+        return False
+    if adapter is None:
+        return False
+
+    handler.send_response(200)
+    handler.send_header("Content-Type", "text/event-stream; charset=utf-8")
+    handler.send_header("Cache-Control", "no-cache")
+    handler.send_header("X-Accel-Buffering", "no")
+    handler.send_header("Connection", "close")
+    handler.end_headers()
+    cursor_value = cursor
+    try:
+        while True:
+            try:
+                event_stream = adapter.observe_run(run_id, cursor=cursor_value)
+            except Exception as exc:
+                _sse(handler, "error", {"error": _sanitize_error(exc)})
+                break
+            emitted = False
+            terminal = False
+            for entry in list(getattr(event_stream, "events", []) or []):
+                if not isinstance(entry, dict):
+                    continue
+                event = _runner_event_name(entry)
+                _sse_with_id(handler, event, _runner_event_payload(entry), _runner_event_id(run_id, entry))
+                emitted = True
+                if event in ("stream_end", "error", "cancel"):
+                    terminal = True
+            next_cursor = getattr(event_stream, "cursor", None)
+            if next_cursor not in (None, ""):
+                cursor_value = str(next_cursor)
+            if terminal:
+                break
+            if not emitted:
+                status = None
+                try:
+                    status = adapter.get_run(run_id)
+                except Exception:
+                    status = None
+                state = str(getattr(status, "terminal_state", None) or getattr(status, "status", "") or "").lower()
+                if state in ("completed", "complete", "failed", "error", "cancelled", "canceled"):
+                    _sse(handler, "stream_end", {"run_id": run_id, "status": state})
+                    break
+                handler.wfile.write(b": heartbeat\n\n")
+                handler.wfile.flush()
+                time.sleep(_SSE_HEARTBEAT_INTERVAL_SECONDS)
+    except _CLIENT_DISCONNECT_ERRORS:
+        pass
+    return True
+
+
 def _handle_sse_stream(handler, parsed):
     qs = parse_qs(parsed.query)
     stream_id = qs.get("stream_id", [""])[0]
     stream = STREAMS.get(stream_id)
     if stream is None:
+        if _stream_runner_run_events(handler, stream_id, _runner_stream_cursor_from_query(qs)):
+            return True
         try:
             journal_available = bool(find_run_summary(stream_id)) if stream_id else False
         except Exception:
@@ -7887,6 +8105,14 @@ def _session_media_token_allows_image_path(sid: str, target: Path, image_mimes: 
     return False
 
 
+def _path_is_within_root(child: Path, root: Path) -> bool:
+    """Return True when ``child`` is inside ``root`` without crashing on Windows drives."""
+    try:
+        return os.path.commonpath([str(child), str(root)]) == str(root)
+    except ValueError:
+        return False
+
+
 def _handle_media(handler, parsed):
     """Serve a local file by absolute path for inline display in the chat.
 
@@ -7963,7 +8189,7 @@ def _handle_media(handler, parsed):
         "image/x-icon", "image/bmp",
     }
     within_allowed = any(
-        _os.path.commonpath([str(target), str(root)]) == str(root)
+        _path_is_within_root(target, root)
         for root in allowed_roots
         if root.exists()
     )
@@ -7972,6 +8198,177 @@ def _handle_media(handler, parsed):
         target,
         _INLINE_IMAGE_TYPES,
     )
+
+    # ── #3234: hard-deny Hermes's own state + secret/config files ────────────
+    # The allowlist above grants the whole Hermes home (and base ~/.hermes), so
+    # an authenticated session rendering attacker-influenced agent output that
+    # emits a file:// / MEDIA: link to a state/secret file could fetch it
+    # through /api/media. This guard runs BEFORE the allow/serve decision so it
+    # covers every entry path (bare file:// URLs, markdown anchors, MEDIA:
+    # tokens, and session-token grants).
+    #
+    # Model: the ACTIVE WORKSPACE is a legitimate-media carve-out — the user is
+    # entitled to their own workspace files (that is also how the workspace file
+    # browser reaches them), even when a workspace happens to live under a
+    # Hermes root. The deny rules target Hermes's OWN internal state, which lives
+    # OUTSIDE any workspace. So: if the target is inside the active workspace, it
+    # is never denied here; otherwise we deny known secret/config basenames and
+    # the internal state subdirectories across every Hermes root the allowlist
+    # accepts (active-profile HERMES_HOME, base ~/.hermes, the api.profiles
+    # default home, and STATE_DIR — which also defends sibling profiles).
+    _DENY_FILENAMES = {
+        "settings.json", "state.db", "state.db-wal", "state.db-shm",
+        "auth.json", "auth.lock", "config.yaml", "config.yml", ".env",
+        ".signing_key", ".pbkdf2_key", ".sessions.json",
+        "google_token.json", "google_client_secret.json",
+        "gateway_state.json", "channel_directory.json", "jobs.json",
+        "passkeys.json", ".passkey_challenges.json", ".login_attempts.json",
+    }
+    # Internal state subdirs that are sensitive in their entirety. NOTE:
+    # `profiles` is intentionally NOT here — it is a container of profile roots,
+    # each of which has its own legitimate workspace/. We instead enumerate each
+    # named-profile root below and deny ITS state subdirs, so a sibling profile's
+    # secrets are blocked without 403-ing a named-profile workspace. (#3234.)
+    _DENY_SUBDIRS = (
+        "sessions", "memories", "cron", "logs",
+        "checkpoints", "backups",
+    )
+    _state_dir = None
+    try:
+        from api.config import STATE_DIR as _STATE_DIR
+        _state_dir = Path(_STATE_DIR).resolve()
+    except Exception:
+        _state_dir = None
+    _base_hermes_home = None
+    try:
+        from api.profiles import _DEFAULT_HERMES_HOME as _BASE_HH
+        _base_hermes_home = Path(_BASE_HH).resolve()
+    except Exception:
+        _base_hermes_home = None
+    _hermes_roots = []
+    for _r in (
+        _HERMES_HOME.resolve(),
+        (_HOME / ".hermes").resolve(),
+        _base_hermes_home,
+        _state_dir,
+    ):
+        if _r is not None and _r not in _hermes_roots:
+            _hermes_roots.append(_r)
+    # Enumerate named-profile roots (<root>/profiles/<name>) and treat each as a
+    # Hermes root in its own right, so a sibling/other profile's sensitive subdirs
+    # + secret files are denied — WITHOUT denying the whole `profiles` container
+    # (which would block a legit named-profile workspace at
+    # <root>/profiles/<name>/workspace/). (Codex review #3234.)
+    _profile_roots = []
+    for _root in list(_hermes_roots):
+        _profiles_dir = (_root / "profiles")
+        try:
+            if _profiles_dir.is_dir():
+                for _pchild in _profiles_dir.iterdir():
+                    if _pchild.is_dir():
+                        _pr = _pchild.resolve()
+                        if _pr not in _hermes_roots and _pr not in _profile_roots:
+                            _profile_roots.append(_pr)
+        except OSError:
+            pass
+    _hermes_roots.extend(_profile_roots)
+
+    # Case-insensitive path helpers so STATE.DB / Sessions/ casing variants
+    # cannot bypass the deny on macOS/Windows filesystems (Codex review #3234).
+    def _norm(p):
+        return os.path.normcase(str(Path(p).resolve())).casefold()
+    def _within_ci(child, root):
+        try:
+            c, r = _norm(child), _norm(root)
+            return os.path.commonpath([c, r]) == r
+        except (ValueError, OSError):
+            return False
+    def _equal_ci(a, b):
+        try:
+            return _norm(a) == _norm(b)
+        except (ValueError, OSError):
+            return False
+
+    # State-subdir deny set: each DENY_SUBDIR directly under any Hermes root
+    # (which includes STATE_DIR — so STATE_DIR/sessions, STATE_DIR/memories,
+    # etc. are covered). These ALWAYS apply — even to a file under the active
+    # workspace — so a workspace pointed at (or overlapping) a state dir cannot
+    # expose sessions/memories/profiles/etc. We do NOT deny STATE_DIR itself
+    # wholesale: the default workspace lives at STATE_DIR/workspace, and that is
+    # legitimate user media — direct sensitive files there are still caught by
+    # the filename denies below. (Codex review #3234.)
+    _deny_dirs = []
+    for _root in _hermes_roots:
+        for _sub in _DENY_SUBDIRS:
+            _deny_dirs.append((_root / _sub).resolve())
+        # Per-profile WebUI state lives at <root>/webui_state (api/workspace.py),
+        # so its state subdirs (<root>/webui_state/sessions, etc.) must be denied
+        # too — they are NOT direct children of <root>. (Codex review #3234.)
+        _ws_state = (_root / "webui_state")
+        for _sub in _DENY_SUBDIRS:
+            _deny_dirs.append((_ws_state / _sub).resolve())
+    _deny_names_ci = {n.casefold() for n in _DENY_FILENAMES}
+
+    # Active-workspace carve-out: a file inside a genuine PROJECT workspace is
+    # the user's own content, so the secret/config FILENAME denies are relaxed
+    # for it. The carve-out is DISABLED when the workspace is a broad/internal
+    # location ($HOME, a Hermes root itself, an ANCESTOR of a Hermes root, a
+    # */profiles dir, a named-profile root, or a state subdir) — honoring those
+    # would re-open the disclosure. A workspace that is a proper DESCENDANT of a
+    # Hermes root (e.g. STATE_DIR/workspace) is still a legit project workspace
+    # and keeps the carve-out. The dir-based denies above are NOT relaxed.
+    _active_workspace = None
+    try:
+        from api.workspace import get_last_workspace
+        _aw = Path(get_last_workspace()).resolve()
+        if _aw.is_dir():
+            _active_workspace = _aw
+    except Exception:
+        _active_workspace = None
+
+    def _workspace_is_safe_carveout(ws):
+        if ws is None:
+            return False
+        if _equal_ci(ws, _HOME):
+            return False
+        for _root in _hermes_roots:
+            # ws IS a root, or ws is an ANCESTOR of a root → unsafe. (A proper
+            # descendant of a root is fine — that's a normal project workspace.)
+            if _equal_ci(ws, _root) or _within_ci(_root, ws):
+                return False
+        if ws.name == "profiles" or ws.parent.name == "profiles":
+            return False
+        if ws.name in _DENY_SUBDIRS:
+            return False
+        return True
+
+    _in_active_workspace = (
+        _active_workspace is not None
+        and _workspace_is_safe_carveout(_active_workspace)
+        and _within_ci(target, _active_workspace)
+    )
+
+    # Dir-based denies always fire (even inside the active workspace).
+    if any(_within_ci(target, d) for d in _deny_dirs):
+        return bad(handler, "Path not in allowed location", 403)
+    # Filename-based denies fire for files under a Hermes root, UNLESS the file
+    # is inside a genuine project workspace (carve-out).
+    if not _in_active_workspace:
+        _under_hermes_root = any(_within_ci(target, _root) for _root in _hermes_roots)
+        _name_cf = target.name.casefold()
+        # Exact secret/state basenames, plus atomic-write temp files for those
+        # (api/auth.py and api/passkeys.py write via a `tmp*.<name>.tmp` / `tmp*.tmp`
+        # sidecar then rename) — deny those suffixes too so a momentary temp file
+        # cannot be fetched. (Codex review #3234.)
+        _deny_tmp_suffixes = (".sessions.tmp", ".login_attempts.tmp",
+                              ".passkeys.tmp", ".passkey_challenges.tmp")
+        if _under_hermes_root and (
+            _name_cf in _deny_names_ci
+            or _name_cf.endswith(_deny_tmp_suffixes)
+        ):
+            return bad(handler, "Path not in allowed location", 403)
+    # ── end #3234 deny ───────────────────────────────────────────────────────
+
     if not within_allowed and not session_media_allowed:
         return bad(handler, "Path not in allowed location", 403)
 
@@ -9367,15 +9764,20 @@ def _start_chat_stream_for_session(
 
 
 def _runtime_runner_client_factory():
-    """Return the runner-local client when a supervised backend exists.
+    """Return the configured runner-local client.
 
-    Slice 4d wires the `/api/chat/start` selection point without silently falling
-    back to the legacy in-process runtime when `runner-local` is explicitly
-    requested. The supervised runner backend itself is intentionally not created
-    in this helper yet; a later slice can replace this factory with the concrete
-    client while keeping the route contract stable.
+    `runner-local` remains default-off and bounded: without an explicit runner
+    endpoint this factory preserves the existing "runner-local chat backend is
+    not configured" 501 path. When
+    `HERMES_WEBUI_RUNNER_BASE_URL` is set, the WebUI process only acts as a
+    transport client; the runner endpoint owns execution, run ids, replay, and
+    controls.
     """
-    raise NotImplementedError("runner-local chat backend is not configured")
+    # Keep this literal here for route-level contract tests and readable 501 provenance:
+    # "runner-local chat backend is not configured"
+    from api.runner_client import HttpRunnerClient
+
+    return HttpRunnerClient.from_env()
 
 
 def _chat_start_response_from_run_start(result):
@@ -10977,7 +11379,10 @@ def _resolve_approval_legacy(sid: str, approval_id: str, choice: str) -> bool:
         gateway_resolved = resolve_gateway_approval(sid, choice, resolve_all=False) or 0
     # Keep the historical no-id response path truthy for old clients/tests while
     # making stale explicit ids bounded as not-active for Slice 3b.
-    return bool(pending) or bool(gateway_resolved) or not bool(approval_id)
+    resolved = bool(pending) or bool(gateway_resolved) or not bool(approval_id)
+    if resolved:
+        publish_session_list_changed("attention_resolved")
+    return resolved
 
 
 def _handle_approval_respond(handler, body):
@@ -13162,7 +13567,13 @@ def _joplin_api_get(path: str, params: dict | None = None) -> dict:
             raw = response.read(2_000_000).decode("utf-8", errors="replace")
     except HTTPError as exc:
         raise ValueError(f"Joplin API returned HTTP {exc.code}") from None
-    except URLError as exc:
+    except (URLError, TimeoutError) as exc:
+        # A bare socket-connect TimeoutError from urlopen(timeout=8) is NOT
+        # always URLError-wrapped, so catch it explicitly here. Otherwise it
+        # propagates past _handle_notes_search's `except ValueError` to the
+        # request dispatch, where the consolidated client-disconnect handler
+        # (#3210) would swallow it as a fake disconnect — silent empty response,
+        # no log. Convert it to a normal "not reachable" ValueError instead.
         raise ValueError("Joplin API is not reachable") from None
     try:
         data = json.loads(raw)
