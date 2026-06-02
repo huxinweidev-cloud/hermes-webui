@@ -10,6 +10,7 @@ const ICONS={
   trash:'<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"><path d="M3.5 4.5h9M6.5 4.5V3h3v1.5M4.5 4.5v8.5h7v-8.5"/><line x1="7" y1="7" x2="7" y2="11"/><line x1="9" y1="7" x2="9" y2="11"/></svg>',
   more:'<svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor" stroke="none"><circle cx="8" cy="3" r="1.25"/><circle cx="8" cy="8" r="1.25"/><circle cx="8" cy="13" r="1.25"/></svg>',
   edit:'<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><path d="M11.5 2.5l2 2L5 13H3v-2z"/><path d="M10 4l2 2"/></svg>',
+  spark:'<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><path d="M8 1.8l1.1 3.1 3.1 1.1-3.1 1.1L8 10.2 6.9 7.1 3.8 6l3.1-1.1z"/><path d="M12.5 9.5l.5 1.5 1.5.5-1.5.5-.5 1.5-.5-1.5-1.5-.5 1.5-.5z"/></svg>',
   link:'<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><path d="M6.7 9.3a3 3 0 0 1 0-4.2l1.7-1.7a3 3 0 0 1 4.2 4.2l-1 1"/><path d="M9.3 6.7a3 3 0 0 1 0 4.2l-1.7 1.7a3 3 0 0 1-4.2-4.2l1-1"/></svg>',
 };
 
@@ -2031,12 +2032,28 @@ function _positionSessionActionMenu(anchorEl){
   if(left+menuW>window.innerWidth-8) left=window.innerWidth-menuW-8;
   _sessionActionMenu.style.left=left+'px';
   _sessionActionMenu.style.top='8px';
+  // Reset any prior clamp so we measure the menu's natural height.
+  _sessionActionMenu.style.maxHeight='';
   const menuH=_sessionActionMenu.offsetHeight || 0;
+  const margin=8;
+  const maxAvail=window.innerHeight-margin*2;
   let top=rect.bottom+6;
-  if(top+menuH>window.innerHeight-8 && rect.top>menuH+12){
+  // Prefer flipping above the row when the menu would overflow the bottom and
+  // there's room above.
+  if(top+menuH>window.innerHeight-margin && rect.top>menuH+12){
     top=rect.top-menuH-6;
   }
-  if(top<8) top=8;
+  // If the menu is taller than the viewport, or still overflows after the flip
+  // attempt (e.g. a top-anchored row with a tall menu and no room above), cap
+  // its height to the viewport and let it scroll instead of clipping off-screen.
+  if(menuH>maxAvail){
+    _sessionActionMenu.style.maxHeight=maxAvail+'px';
+    top=margin;
+  } else {
+    // Clamp vertically so the whole menu stays on-screen at both edges.
+    if(top+menuH>window.innerHeight-margin) top=window.innerHeight-margin-menuH;
+    if(top<margin) top=margin;
+  }
   _sessionActionMenu.style.top=top+'px';
 }
 
@@ -2044,12 +2061,17 @@ function _buildSessionAction(label, meta, icon, onSelect, extraClass=''){
   const opt=document.createElement('button');
   opt.type='button';
   opt.className='ws-opt session-action-opt'+(extraClass?` ${extraClass}`:'');
+  // Compact context-menu shape (#3223 redesign, Nathan 2026-06-01): show only
+  // icon + label, matching VS Code / browser / ChatGPT conversation menus. The
+  // descriptive `meta` is preserved as a hover tooltip (title=) so the
+  // information stays discoverable without consuming permanent vertical space —
+  // this also keeps the menu short enough to avoid viewport clipping.
+  if(meta) opt.title=meta;
   opt.innerHTML=
     `<span class="ws-opt-action">`
       + `<span class="ws-opt-icon">${icon}</span>`
       + `<span class="session-action-copy">`
         + `<span class="ws-opt-name">${esc(label)}</span>`
-        + (meta?`<span class="session-action-meta">${esc(meta)}</span>`:'')
       + `</span>`
     + `</span>`;
   opt.onclick=async(e)=>{
@@ -2301,6 +2323,39 @@ function _openSessionActionMenu(session, anchorEl){
         closeSessionActionMenu();
         await cancelSessionStream(session);
         showToast(t('stream_stopped'));
+      }
+    ));
+  }
+  // Title regeneration matches the backend guard (api/routes.py rejects
+  // read_only OR is_imported with 403). read_only sessions already bailed at
+  // the isReadOnly early-return above; skip imported sessions here so the
+  // action is hidden rather than failing with a 403 toast. This keeps the
+  // is_imported gate scoped to regenerate instead of broadening the shared
+  // _isReadOnlySession() helper (which gates rename/pin/archive/etc.).
+  if(!session.is_imported){
+    menu.appendChild(_buildSessionAction(
+      t('session_title_regenerate'),
+      t('session_title_regenerate_desc'),
+      ICONS.spark,
+      async()=>{
+        closeSessionActionMenu();
+        try{
+          if(typeof showToast==='function') showToast(t('session_title_regenerating'), 1600);
+          const response=await api('/api/session/title/regenerate',{method:'POST',body:JSON.stringify({session_id:session.session_id})});
+          const nextTitle=(response&&response.title)||(response&&response.session&&response.session.title)||'';
+          if(nextTitle){
+            session.title=nextTitle;
+            const cached=(_allSessions||[]).find(item=>item&&item.session_id===session.session_id);
+            if(cached) cached.title=nextTitle;
+            if(S.session&&S.session.session_id===session.session_id){S.session.title=nextTitle;syncTopbar();}
+            renderSessionListFromCache();
+          }
+          if(typeof showToast==='function') showToast(t('session_title_regenerated', nextTitle||t('untitled')), 2400);
+        }catch(err){
+          const msg=t('session_title_regenerate_failed')+(err&&err.message?err.message:String(err));
+          setStatus(msg);
+          if(typeof showToast==='function') showToast(msg,3000,'error');
+        }
       }
     ));
   }
@@ -4978,19 +5033,38 @@ function _showProjectPicker(session, anchorEl){
   none.onclick=async()=>{
     picker.remove();
     document.removeEventListener('click',close);
-    await api('/api/session/move',{method:'POST',body:JSON.stringify({session_id:session.session_id,project_id:null})});
-    // Sidebar rows are shallow copies of _allSessions entries (see
-    // _attachChildSessionsToSidebarRows), so mutating `session` only updates
-    // the discarded copy. Write into the authoritative cache so the next
-    // renderSessionListFromCache() reflects the move. (#2551)
-    const idx=_allSessions.findIndex(s=>s&&s.session_id===session.session_id);
-    if(idx>=0) _allSessions[idx].project_id=null;
-    renderSessionListFromCache();
-    showToast('Removed from project');
+    try {
+      await api('/api/session/move',{method:'POST',body:JSON.stringify({session_id:session.session_id,project_id:null})});
+      // Sidebar rows are shallow copies of _allSessions entries (see
+      // _attachChildSessionsToSidebarRows), so mutating `session` only updates
+      // the discarded copy. Write into the authoritative cache so the next
+      // renderSessionListFromCache() reflects the move. (#2551)
+      const idx=_allSessions.findIndex(s=>s&&s.session_id===session.session_id);
+      if(idx>=0) _allSessions[idx].project_id=null;
+      renderSessionListFromCache();
+      showToast('Removed from project');
+    } catch(e) {
+      showToast('Unassign failed: '+(e.message||e));
+    }
   };
   picker.appendChild(none);
-  // Project options
+  // Project options — only show projects matching the session's profile.
+  // #3331 follow-up (Codex gate): mirror the server's root-alias tolerance —
+  // `_profiles_match` treats the literal 'default' and a renamed-root display
+  // name as equivalent, so a server-approved `profile:'default'` project must
+  // not be hidden for a session stamped with the renamed-root profile (and
+  // vice versa). Only hide when BOTH sides are explicit, distinct, AND neither
+  // is the 'default' alias; let the server's allowlist be authoritative for the
+  // default/renamed-root case.
+  const sessionProfile = session ? (session.profile || undefined) : undefined;
+  const _profileHidesProject = (projProfile) => {
+    if(!sessionProfile || !projProfile) return false;
+    if(projProfile === sessionProfile) return false;
+    if(projProfile === 'default' || sessionProfile === 'default') return false;
+    return true;
+  };
   for(const p of _allProjects){
+    if (_profileHidesProject(p.profile)) continue;
     const item=document.createElement('div');
     item.className='project-picker-item'+(session.project_id===p.project_id?' active':'');
     if(p.color){
@@ -5005,12 +5079,14 @@ function _showProjectPicker(session, anchorEl){
     item.onclick=async()=>{
       picker.remove();
       document.removeEventListener('click',close);
-      await api('/api/session/move',{method:'POST',body:JSON.stringify({session_id:session.session_id,project_id:p.project_id})});
-      // See #2551 — write to _allSessions, not the shallow sidebar copy.
-      const idx=_allSessions.findIndex(s=>s&&s.session_id===session.session_id);
-      if(idx>=0) _allSessions[idx].project_id=p.project_id;
-      renderSessionListFromCache();
-      showToast('Moved to '+p.name);
+      try{
+        await api('/api/session/move',{method:'POST',body:JSON.stringify({session_id:session.session_id,project_id:p.project_id})});
+        // See #2551 — write to _allSessions, not the shallow sidebar copy.
+        const idx=_allSessions.findIndex(s=>s&&s.session_id===session.session_id);
+        if(idx>=0) _allSessions[idx].project_id=p.project_id;
+        renderSessionListFromCache();
+        showToast('Moved to '+p.name);
+      }catch(e){showToast('Move failed: '+(e.message||e));}
     };
     picker.appendChild(item);
   }
@@ -5028,7 +5104,8 @@ function _showProjectPicker(session, anchorEl){
     });
     if(!name||!name.trim()) return;
     const color=PROJECT_COLORS[_allProjects.length%PROJECT_COLORS.length];
-    const res=await api('/api/projects/create',{method:'POST',body:JSON.stringify({name:name.trim(),color})});
+    const profile = session.profile || undefined;
+    const res=await api('/api/projects/create',{method:'POST',body:JSON.stringify({name:name.trim(),color,profile})});
     if(res.project){
       _allProjects.push(res.project);
       // Now move session into it
@@ -5119,9 +5196,13 @@ function _startProjectRename(proj, chip){
   inp.value=proj.name;
   const finish=async(save)=>{
     if(save&&inp.value.trim()&&inp.value.trim()!==proj.name){
-      await api('/api/projects/rename',{method:'POST',body:JSON.stringify({project_id:proj.project_id,name:inp.value.trim()})});
-      await renderSessionList();
-      showToast('Project renamed');
+      try {
+        await api('/api/projects/rename',{method:'POST',body:JSON.stringify({project_id:proj.project_id,name:inp.value.trim()})});
+        await renderSessionList();
+        showToast('Project renamed');
+      } catch(e) {
+        showToast('Rename failed: '+(e.message||e));
+      }
     }else{
       renderSessionListFromCache();
     }
@@ -5172,9 +5253,13 @@ function _showProjectContextMenu(e, proj, chip){
     if(hex===(proj.color||'')) dot.style.outline='2px solid var(--text)';
     dot.onclick=async()=>{
       menu.remove();
-      await api('/api/projects/rename',{method:'POST',body:JSON.stringify({project_id:proj.project_id,name:proj.name,color:hex})});
-      await renderSessionList();
-      showToast('Color updated');
+      try {
+        await api('/api/projects/rename',{method:'POST',body:JSON.stringify({project_id:proj.project_id,name:proj.name,color:hex})});
+        await renderSessionList();
+        showToast('Color updated');
+      } catch(e) {
+        showToast('Color update failed: '+(e.message||e));
+      }
     };
     colorRow.appendChild(dot);
   });
@@ -5204,10 +5289,14 @@ async function _confirmDeleteProject(proj){
     danger:true
   });
   if(!ok){return;}
-  await api('/api/projects/delete',{method:'POST',body:JSON.stringify({project_id:proj.project_id})});
-  if(_activeProject===proj.project_id) _activeProject=null;
-  await renderSessionList();
-  showToast('Project deleted');
+  try {
+    await api('/api/projects/delete',{method:'POST',body:JSON.stringify({project_id:proj.project_id})});
+    if(_activeProject===proj.project_id) _activeProject=null;
+    await renderSessionList();
+    showToast('Project deleted');
+  } catch(e) {
+    showToast('Delete failed: '+(e.message||e));
+  }
 }
 
 // Global Escape handler for batch select mode
