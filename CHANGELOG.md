@@ -3,6 +3,20 @@
 
 ## [Unreleased]
 
+## [v0.51.212] — 2026-06-02 — Release GF (stage-batch2 — i18n regenerate-title strings + self-restart argv + todos cold-load)
+
+### Fixed
+- Localized the five `session_title_regenerate*` session-menu strings (the "Regenerate title" action, its description, and the regenerating/regenerated/failed states) that shipped as English text in every non-English locale. Translated across it, ja, ru, es, de, zh, zh-Hant, pt, ko, fr, and tr, matching each locale's existing terminology; `zh`/`zh-Hant` keep the `\u`-escaped style of those blocks (#3396, @vanshaj-pahwa, closes #3364).
+- Self-update re-exec now distinguishes source checkouts from frozen/packaged builds: a frozen binary (`sys.frozen`) re-execs with `sys.argv` as-is, while source checkouts keep the `[sys.executable] + sys.argv` CPython idiom. Previously the frozen path re-inserted the binary as `argv[1]`, turning re-exec into a no-op that left the WebUI stuck "offline" after every self-update (#3395, @PatrickNoFilter).
+- The Todos panel now hydrates correctly on a cold session load (page refresh) even when the latest todo tool result is outside the truncated display window: `/api/session` derives a compact `todo_state` sidecar from the full settled transcript, and an explicit empty todo list is honored as the current state instead of falling through to an older non-empty write. A malformed historical tool message can never break session loading (#3373, @v2psv).
+
+## [v0.51.211] — 2026-06-02 — Release GE (stage-batch1 — reasoning heuristics + /model shortest-match + Copilot env-token filter)
+
+### Fixed
+- Generalized reasoning-effort capability checks in `_candidate_supports_reasoning` to target whole model families (GPT-5+, Claude 4/3.7, Qwen-3, Kimi, Minimax, Mimo, GLM, Step, and DeepSeek) instead of anchoring on hardcoded version numbers or vendor formats. This prevents the thinking-level configuration selector from being hidden on custom providers, new model releases, or when names carry suffixes like `-free` or `:free` (common on integrations such as Kilo Code or OpenCode Zen). The GPT heuristic is now version-anchored (5+) to avoid falsely enabling reasoning_effort for gpt-4o/4.1/3.5 on aggregator providers (#3379, @b3nw, closes #3377).
+- The `/model` slash command no longer selects a longer model variant when a shorter name is a prefix of it (e.g. `/model mimo-v2.5` selecting `mimo-v2.5-pro`). The fuzzy fallback now prefers an exact id/label match and otherwise the shortest matching option, applied to both the main and bare-name (`provider/...`) fallbacks (#3394, @vanshaj-pahwa, closes #3368).
+- `GITHUB_TOKEN` and `GH_TOKEN` environment variables are now filtered from the Copilot credential pool alongside the seeded `gh`-CLI token, so a classic PAT (`ghp_*`) auto-detected from the environment no longer makes Copilot appear in the model picker when the Copilot API can't use it. User-specific `COPILOT_GITHUB_TOKEN` is still respected (#3382, @happy5318).
+
 ## [v0.51.210] — 2026-06-02 — Release GD (stage-batch1 — model-picker multi-slash fix + extensionless preview highlighting)
 
 ### Fixed
