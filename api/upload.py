@@ -40,11 +40,30 @@ _MAX_EXTRACTED_BYTES = 10 * MAX_UPLOAD_BYTES
 
 def parse_multipart(rfile, content_type, content_length) -> tuple:
     import re as _re, email.parser as _ep
+    # Imported locally (not just module-level) so the function stays
+    # self-contained — some tests exec() this function's source in an isolated
+    # namespace, and a bare module global would NameError there.
+    try:
+        from api.config import MAX_UPLOAD_BYTES as _MAX_UPLOAD_BYTES
+    except Exception:
+        _MAX_UPLOAD_BYTES = 20 * 1024 * 1024
     m = _re.search(r'boundary=([^;\s]+)', content_type)
     if not m:
         raise ValueError('No boundary in Content-Type')
     boundary = m.group(1).strip('"').encode()
-    raw = rfile.read(content_length)
+    # Centralized length guard for ALL upload callers: a missing/garbage or
+    # NEGATIVE Content-Length must never reach rfile.read(<0), which reads the
+    # stream unbounded (read(-1) == read-to-EOF) and bypasses the per-handler
+    # size cap. Reject anything not in [0, MAX_UPLOAD_BYTES].
+    try:
+        length = int(content_length)
+    except (TypeError, ValueError):
+        raise ValueError('Invalid Content-Length') from None
+    if length < 0:
+        raise ValueError('Invalid Content-Length (negative)')
+    if length > _MAX_UPLOAD_BYTES:
+        raise ValueError(f'Upload too large (max {_MAX_UPLOAD_BYTES} bytes)')
+    raw = rfile.read(length)
     fields = {}
     files = {}
     delimiter = b'--' + boundary
@@ -401,6 +420,14 @@ def handle_workspace_upload(handler):
 
         # Resolve target subdirectory within workspace
         target_dir = safe_resolve_ws(workspace, subpath) if subpath else workspace
+        # safe_resolve_ws intentionally permits in-workspace symlinks pointing
+        # outside the root (read trust model). For an UPLOAD target that's not
+        # acceptable: a planted symlink subpath would let mkdir() + writes create
+        # files OUTSIDE the workspace. Require the resolved target to be inside
+        # the workspace before creating anything. (is_relative_to is True for the
+        # workspace==target equality case, so the normal subpath='' path passes.)
+        if not target_dir.resolve().is_relative_to(workspace.resolve()):
+            return j(handler, {'error': 'Upload target escapes workspace'}, status=403)
         target_dir.mkdir(parents=True, exist_ok=True)
 
         results = []
@@ -434,8 +461,11 @@ def handle_workspace_upload(handler):
             dest.write_bytes(file_bytes)
             mime = mimetypes.guess_type(safe_name)[0] or 'application/octet-stream'
 
-            # For archives, optionally extract into the target directory
-            is_archive = safe_name.lower().endswith(('.zip', '.tar.gz', '.tgz', '.tar.bz2', '.tar.xz'))
+            # For archives, optionally extract into the target directory.
+            # Suffix set MUST match extract_archive()'s supported formats, else
+            # accepted-but-unlisted archives (.tar/.tbz2/.txz) silently land as
+            # raw files instead of extracting.
+            is_archive = safe_name.lower().endswith(('.zip', '.tar', '.tar.gz', '.tgz', '.tar.bz2', '.tbz2', '.tar.xz', '.txz'))
             if is_archive:
                 import zipfile, tarfile, traceback as _extract_tb
                 try:
