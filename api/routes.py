@@ -2861,6 +2861,7 @@ from api.models import (
     get_state_db_session_summary,
     merge_session_messages_append_only,
     _session_message_merge_key,
+    _active_stream_ids,
     _is_empty_partial_activity_message,
     _hide_from_default_sidebar,
     prune_session_from_index,
@@ -5146,7 +5147,15 @@ def handle_get(handler, parsed) -> bool:
                     )
                 except (TypeError, ValueError):
                     _merged_last_message_at = 0
-            raw = s.compact() | {
+            active_stream_ids = _active_stream_ids()
+            try:
+                compact_session = s.compact(
+                    include_runtime=True,
+                    active_stream_ids=active_stream_ids,
+                )
+            except TypeError:
+                compact_session = s.compact()
+            raw = compact_session | {
                 "messages": _truncated_msgs,
                 "message_count": _merged_message_count,
                 "tool_calls": _session_tool_calls,
@@ -5164,9 +5173,10 @@ def handle_get(handler, parsed) -> bool:
                 except Exception:
                     journal = None
                 if journal:
+                    journal_active = bool(original_stream_id in active_stream_ids)
                     raw["runtime_journal"] = _run_journal_status_payload(
                         journal,
-                        active=bool(getattr(s, "active_stream_id", None)),
+                        active=journal_active,
                     )
             # Cold-load: derive the latest settled todo snapshot from the full
             # merged transcript, not the truncated display window. This keeps
@@ -6766,7 +6776,19 @@ def handle_post(handler, parsed) -> bool:
             s = get_session(body["session_id"])
         except KeyError:
             return bad(handler, "Session not found", 404)
-        keep = int(body["keep_count"])
+        # Validate keep_count before it reaches the destructive `messages[:keep]`
+        # slice. A non-numeric value would raise ValueError and surface as a
+        # confusing 500; a NEGATIVE value slices as `messages[:-N]`, which
+        # silently DELETES the most recent N messages (e.g. keep_count=-5 on a
+        # 3-message session wipes the whole transcript) and then persists it via
+        # save(). Mirror the explicit guard the /api/session/branch handler
+        # already applies to its own keep_count. (Opus pre-release follow-up.)
+        try:
+            keep = int(body["keep_count"])
+        except (ValueError, TypeError):
+            return bad(handler, "keep_count must be an integer")
+        if keep < 0:
+            return bad(handler, "keep_count must be non-negative")
         with _get_session_agent_lock(body["session_id"]):
             old_msg_count = len(s.messages or [])
             old_ctx_count = len(getattr(s, 'context_messages', None) or [])
@@ -8188,7 +8210,15 @@ def _handle_sessions_search(handler, parsed):
     qs = parse_qs(parsed.query)
     q = qs.get("q", [""])[0].lower().strip()
     content_search = qs.get("content", ["1"])[0] == "1"
-    depth = int(qs.get("depth", ["5"])[0])
+    # Reject a malformed depth instead of letting int() raise ValueError and
+    # surface as a confusing 500. Clamp to >= 0 so a negative value can't reach
+    # the messages[:depth] slice below — messages[:-n] would silently exclude
+    # the most recent messages from the content search instead of capping it.
+    # (depth == 0 keeps its existing meaning: search the full transcript.)
+    try:
+        depth = max(0, int(qs.get("depth", ["5"])[0]))
+    except (ValueError, TypeError):
+        depth = 5
     if not q:
         safe_sessions = []
         for s in all_sessions():
@@ -10238,9 +10268,18 @@ def _handle_cron_output(handler, parsed):
 
     qs = parse_qs(parsed.query)
     job_id = qs.get("job_id", [""])[0]
-    limit = int(qs.get("limit", ["5"])[0])
     if not job_id:
         return j(handler, {"error": "job_id required"}, status=400)
+    # Reject malformed limit instead of letting int() raise ValueError and
+    # surface as a confusing 500. Clamp to a safe range; a negative value must
+    # never reach the slice below — files is sorted newest-first, so a negative
+    # limit on `files[:limit]` slices as `files[:-n]` and drops the n OLDEST
+    # entries (or all of them when |n| >= len), returning a truncated/empty list
+    # instead of the newest outputs. Mirrors _handle_cron_run_detail.
+    try:
+        limit = max(1, min(500, int(qs.get("limit", ["5"])[0])))
+    except (ValueError, TypeError):
+        limit = 5
     out_dir = CRON_OUT / job_id
     outputs = []
     if out_dir.exists():
@@ -10272,7 +10311,13 @@ def _handle_cron_recent(handler, parsed):
     import datetime
 
     qs = parse_qs(parsed.query)
-    since = float(qs.get("since", ["0"])[0])
+    # Reject a malformed `since` instead of letting float() raise ValueError and
+    # surface as a confusing 500. A bad/absent value means "from the epoch", so
+    # the client still gets a well-formed (if unfiltered) response.
+    try:
+        since = float(qs.get("since", ["0"])[0])
+    except (ValueError, TypeError):
+        since = 0.0
     try:
         from cron.jobs import list_jobs
 
