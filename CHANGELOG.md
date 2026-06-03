@@ -3,7 +3,47 @@
 
 ## [Unreleased]
 
-## [v0.51.223] — 2026-06-02 — Release GQ (stage-p5 — openai-api picker provider + MiniMax-M3)
+## [v0.51.230] — 2026-06-03 — Release GX (stage-p14 — extract <think> blocks to m.reasoning + LLM Wiki last-writer)
+
+### Fixed
+- Assistant message `<think>…</think>` blocks are now extracted into `m.reasoning` instead of being stored inline in `m.content` — **both client-side (streaming/inflight state) and server-side at save time**. Reasoning-only providers such as `MiniMax-M3` (OpenAI-compat) previously left the thinking trace inside the assistant content, bloating persisted session files by 30–50% and bypassing the `m.reasoning` field the thinking card reads on reload. A new `_splitThinkFromContent()` (in `static/messages.js`) and its server-side twin `_split_thinking_from_content()` (in `api/streaming.py`, applied to the final assistant message before `s.save()`) extract a single **leading** block (after lstrip) for all three known tag pairs, matching the live renderer's `_streamDisplay`/`_parseStreamState` semantics exactly: a closed `<think>…</think>` that appears mid-body (e.g. a literal tag inside a fenced code block) stays visible content and is never moved into reasoning, a partial/unclosed block is left intact, and any pre-existing `m.reasoning` (from a separate `on_reasoning` stream) is preserved/merged. So the persisted session file — not just the in-browser copy — is compacted on reload (#3455 part 1, @gsurenull).
+- The LLM Wiki status panel's `Last writer` field is now populated (it always showed `Not available` since the panel shipped in #1257). The reader uses a 3-tier fallback — most-recent page frontmatter (`updated_by`/`writer`/`author`), the most recent `log.md` action verb, then a static `ai-agent` fallback — and reads only frontmatter + log headings, never page bodies, preserving the private-safe status contract (#3455 part 2, @gsurenull; closes #1257).
+
+## [v0.51.229] — 2026-06-03 — Release GW (stage-p13 — /model never silently snaps a versioned name to a -tier variant)
+
+### Fixed
+- `/model <name>` no longer silently snaps a complete versioned model name to a longer `-tier` variant (and a different price tier). When the typed name ends in a version number (e.g. `mimo-v2.5`) and the catalog has only a longer suffixed variant (e.g. `xiaomi/mimo-v2.5-pro`), both the dropdown matcher (`_findModelInDropdown`) and the command fallback (`_bestModelMatch`) now reject the snap unless the extra text *continues the version* (`.` + digit), rather than upgrading the user to a `-pro`/`-flash` tier they did not type. When nothing matches cleanly, `/model` now shows a *"No model matching … — did you mean …?"* suggestion toast instead of silently switching. Legitimate fuzzy shorthand is preserved (`/model gpt-5` → `gpt-5.4-mini`, `/model claude` → `claude-opus-4.6`, `/model mimo-v2` → `mimo-v2.5-pro`), as is exact-match priority (#3368, with @garyd9; thanks @yutaotie for confirmation).
+
+## [v0.51.228] — 2026-06-03 — Release GV (stage-p12 — workspace file-tree drop + large-markdown preview)
+
+### Fixed
+- Dropping an OS file onto the **workspace file tree** now uploads it into the workspace only, instead of *also* attaching it to the chat composer. The tree's drag handlers now stop event propagation for OS `Files` drops so the document-level composer drop handler no longer fires for the same drop (#3411, @pamnard).
+- Moderately large Markdown documents in the **workspace preview** are no longer forced into plain-text too early. The rich-render ceiling is raised (64 KB / 1500 lines → 256 KB / 5000 lines, and the backend file-read limit 200 KB → 400 KB), and files above the limit gain a **"Render as markdown anyway"** button that force-renders the already-loaded content without a second fetch (#3378, @starGazerK).
+
+## [v0.51.227] — 2026-06-03 — Release GU (stage-p11 — keep the active New Chat visible in the sidebar)
+
+### Fixed
+- A freshly-created **New Chat** now stays visible and selected in the sidebar before its first message is sent. The sidebar intentionally filters inactive 0-message sessions, but that filter also hid the *currently active* blank chat until the user sent a turn — so starting a New Chat could make the selected row vanish from the list. The active ephemeral session is now injected into the sidebar render rows (only when the server-side list omits it), while inactive empty sessions stay filtered as before. Starting a New Chat from a CLI-filtered sidebar also switches the source filter back to WebUI so the active chat isn't immediately hidden (#3408, @AJV20).
+
+## [v0.51.226] — 2026-06-03 — Release GT (stage-p9 — mobile composer context-usage ring + activity-feed default-expand setting)
+
+### Added
+- **Settings → Appearance: "Expand activity feed by default"** — a new checkbox (default off) that expands new Activity disclosures by default as turns arrive. Manual per-turn collapse/expand still wins (an explicit user toggle is preserved), and live "Waiting on model" rows now explain what the agent is doing before and after tool calls (#3080, @AJV20).
+
+### Changed
+- The mobile composer's config button now shows a **context-usage ring** (an SVG progress ring with a centered percentage) in place of the static sliders icon, color-coded green (≤50%) / orange (≤85%) / red (>85%) and reset to 0% on a new session, so context-window pressure is visible at a glance on mobile (#3062, @NottheGuy007).
+
+## [v0.51.225] — 2026-06-03 — Release GS (stage-p7 — remote gateway health probe resolves gateway_state)
+
+### Fixed
+- The remote-gateway health probe now correctly reports `gateway_state`, so the Tasks/Cron banner lights up for Docker / remote-gateway deployments. The probe previously hit `/health` and `/status` (neither returns `gateway_state`) and never queried `/health/detailed` (which does), so `gateway_state == "running"` was never observed remotely. The probe now tries `/health/detailed` first, parses the JSON body of a 2xx response to extract `gateway_state`, and unifies the gateway base-URL env precedence to `GATEWAY_HEALTH_URL` > `HERMES_GATEWAY_HEALTH_URL` > `HERMES_API_URL` (#3355, @rodboev).
+
+## [v0.51.224] — 2026-06-03 — Release GR (stage-p6 — profile tool/skill config authoritative on the streaming worker)
+
+### Fixed
+- Profile tool/skill restrictions are now respected for WebUI chats even when the per-session "Tool Restrictions" field is left blank. The streaming agent runs on a detached worker thread that does not inherit the per-request thread-local profile context, so the ambient `get_config()` resolved the process-global `default` profile and loaded its `platform_toolsets.cli` (all tools) instead of the session profile's configured list — inflating a tools-disabled profile's prompt from ~400 to ~15K input tokens. The worker now reads the session's own profile config explicitly via a new `get_config_for_profile_home()` helper (a race-free direct disk read with no shared-cache mutation), so toolsets, prefill context, and fallback chains all match the profile the session actually runs under (#3294, @nesquena-hermes).
+
+## [v0.51.223] — 2026-06-02 — Release GQ (stage-p5 — openai-api first-class picker provider + MiniMax-M3)
 
 ### Fixed
 - GPT models now appear in the model picker when hermes-agent exposes its built-in OpenAI provider under the `openai-api` slug (the one activated by `OPENAI_API_KEY` / `OPENAI_BASE_URL`, distinct from `openai-codex`). `openai-api` is now a first-class picker provider in `_PROVIDER_DISPLAY` / `_PROVIDER_MODELS` rather than an alias of `openai` — an alias would have fixed the display but broken the send path, since the agent registry has `openai-api` and not `openai`. Env detection for `OPENAI_API_KEY` was also corrected to surface `openai-api` instead of a bare `openai` the agent registry can't resolve (#3443, @rodboev).

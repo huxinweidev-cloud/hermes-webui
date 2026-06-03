@@ -382,6 +382,43 @@ def _load_yaml_config_file(config_path: Path) -> dict:
         return {}
 
 
+def get_config_for_profile_home(profile_home: "Path | str | None") -> dict:
+    """Return the config dict for an explicit profile home directory.
+
+    The streaming agent runs on a detached worker thread that does NOT inherit
+    the per-request thread-local profile context (set from the ``hermes_profile``
+    cookie on the HTTP handler thread). On that worker, the ambient
+    ``get_config()`` resolves through ``get_active_profile_name()`` which falls
+    back to the process-global ``_active_profile`` (usually ``default``) — so a
+    session running under a non-default profile would silently read the
+    **default** profile's ``config.yaml`` for toolsets, prefill context, and
+    fallback chains (issue #3294).
+
+    This helper reads the config for a *known* profile home directly off disk,
+    bypassing the thread-local resolver entirely. When ``profile_home`` matches
+    the path the ambient resolver would pick (the common single-profile case),
+    we return the cached ``get_config()`` to preserve in-memory overrides used
+    by tests and runtime callers. Only when the session's profile home diverges
+    from the ambient path do we read the session profile's file directly — a
+    pure read with no global cache mutation, so it is race-free across
+    concurrent sessions on different profiles.
+    """
+    if not profile_home:
+        return get_config()
+    try:
+        target = Path(profile_home).expanduser()
+    except Exception:
+        return get_config()
+    # If the ambient resolver already points at this profile home, defer to
+    # get_config() so in-memory overrides (monkeypatched cfg) are honored.
+    try:
+        if _get_config_path().parent == target:
+            return get_config()
+    except Exception:
+        pass
+    return _load_yaml_config_file(target / "config.yaml")
+
+
 def _save_yaml_config_file(config_path: Path, config_data: dict) -> None:
     try:
         import yaml as _yaml
@@ -528,7 +565,7 @@ def verify_hermes_imports() -> tuple:
 
 
 # ── Limits ───────────────────────────────────────────────────────────────────
-MAX_FILE_BYTES = 200_000
+MAX_FILE_BYTES = 400_000
 MAX_UPLOAD_BYTES = _env_mb_bytes("HERMES_WEBUI_MAX_UPLOAD_MB", 20)
 
 # ── File type maps ───────────────────────────────────────────────────────────
@@ -4912,6 +4949,7 @@ _SETTINGS_DEFAULTS = {
     "font_size": "default",  # small | default | large | xlarge
     "session_jump_buttons": False,  # show Start/End transcript jump pills
     "session_endless_scroll": False,  # auto-load older transcript pages while scrolling upward
+    "activity_feed_expanded_default": False,  # expand Activity disclosures by default for new turns
     "pinned_sessions_limit": 3,  # maximum active pinned sessions shown in the sidebar
     "inflight_state_max_sessions": 8,  # max active-stream recovery snapshots kept in browser localStorage
     "inflight_state_max_messages": 24,  # max recent messages kept per recovery snapshot
@@ -5076,6 +5114,7 @@ _SETTINGS_BOOL_KEYS = {
     "api_redact_enabled",
     "session_jump_buttons",
     "session_endless_scroll",
+    "activity_feed_expanded_default",
 }
 # Language codes are validated as short alphanumeric BCP-47-like tags (e.g. 'en', 'zh', 'fr')
 _SETTINGS_LANG_RE = __import__("re").compile(r"^[a-zA-Z]{2,10}(-[a-zA-Z0-9]{2,8})?$")
