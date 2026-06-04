@@ -2882,6 +2882,7 @@ from api.workspace import (
     read_file_content,
     safe_resolve_ws,
     resolve_trusted_workspace,
+    open_anchored_fd,
     validate_workspace_to_add,
     _is_blocked_system_path,
     _strip_surrounding_quotes,
@@ -7108,6 +7109,9 @@ def handle_post(handler, parsed) -> bool:
 
     if parsed.path == "/api/file/rename":
         return _handle_file_rename(handler, body)
+
+    if parsed.path == "/api/file/move":
+        return _handle_file_move(handler, body)
 
     if parsed.path == "/api/file/create-dir":
         return _handle_create_dir(handler, body)
@@ -12032,6 +12036,101 @@ def _handle_file_rename(handler, body):
         new_rel = str(dest.relative_to(Path(s.workspace)))
         return j(handler, {"ok": True, "old_path": body["path"], "new_path": new_rel})
     except (ValueError, PermissionError, OSError) as e:
+        return bad(handler, _sanitize_error(e))
+
+
+def _handle_file_move(handler, body):
+    try:
+        require(body, "session_id", "path", "dest_dir")
+    except ValueError as e:
+        return bad(handler, str(e))
+    try:
+        s = get_session_for_file_ops(body["session_id"])
+    except KeyError:
+        return bad(handler, "Session not found", 404)
+    try:
+        ws_root = Path(s.workspace)
+        # safe_resolve() returns paths under the RESOLVED root, so compute
+        # returned relative paths against the resolved root too — otherwise a
+        # symlinked workspace root (e.g. macOS /tmp -> /private/tmp) makes
+        # dest.relative_to(ws_root) raise after a successful on-disk move,
+        # returning a confusing 400 for a move that actually happened.
+        ws_root_resolved = ws_root.resolve()
+        source = safe_resolve(ws_root, body["path"])
+        if not source.exists():
+            return bad(handler, "File not found", 404)
+        # Reject a symlinked SOURCE entry. safe_resolve() follows the final
+        # symlink, so source.name/source.parent would point at the link's
+        # TARGET, not the dragged entry — moving link.txt would silently move
+        # dir/real.txt and leave link.txt dangling. Detect the symlink on the
+        # lexically-requested final component (lstat, no-follow) and refuse.
+        if (ws_root / body["path"]).is_symlink():
+            return bad(handler, "Cannot move a symlinked entry")
+        dest_dir_raw = (body.get("dest_dir") or ".").strip()
+        if not dest_dir_raw:
+            dest_dir_raw = "."
+        if ".." in dest_dir_raw.split("/"):
+            return bad(handler, "Invalid destination")
+        dest_parent = safe_resolve(ws_root, dest_dir_raw)
+        if not dest_parent.is_dir():
+            return bad(handler, "Destination folder not found", 404)
+        if source.is_dir():
+            try:
+                dest_parent.resolve().relative_to(source.resolve())
+                return bad(handler, "Cannot move a folder into itself or its subfolder")
+            except ValueError:
+                pass
+        dest = dest_parent / source.name
+        if dest.resolve() == source.resolve():
+            new_rel = str(source.relative_to(ws_root_resolved))
+            return j(
+                handler,
+                {"ok": True, "old_path": body["path"], "new_path": new_rel},
+            )
+        # Perform the move race-safely. The path-based checks above can be raced
+        # (TOCTOU): between validating dest_parent and renaming, dest_dir could be
+        # swapped to a symlink pointing outside the workspace, and a path-based
+        # rename would follow it. Open BOTH parent directories as workspace-anchored
+        # fds (openat + O_NOFOLLOW — every component verified non-symlink), do the
+        # collision check by fd, then rename via src_dir_fd/dst_dir_fd so the kernel
+        # operates on the verified directories, not re-resolved pathnames.
+        leaf = source.name
+        if os.open in getattr(os, "supports_dir_fd", set()):
+            src_parent_fd = open_anchored_fd(ws_root, source.parent, want_dir=True)
+            try:
+                dst_parent_fd = open_anchored_fd(ws_root, dest_parent, want_dir=True)
+                try:
+                    try:
+                        os.stat(leaf, dir_fd=dst_parent_fd, follow_symlinks=False)
+                        return bad(
+                            handler,
+                            f'A file named "{leaf}" already exists in that folder',
+                        )
+                    except FileNotFoundError:
+                        pass
+                    os.rename(
+                        leaf, leaf,
+                        src_dir_fd=src_parent_fd, dst_dir_fd=dst_parent_fd,
+                    )
+                finally:
+                    os.close(dst_parent_fd)
+            finally:
+                os.close(src_parent_fd)
+        else:
+            # Windows / no openat: no new race protection available, but creating
+            # symlinks needs admin there. Fall back to the path-based rename.
+            if dest.exists():
+                return bad(
+                    handler,
+                    f'A file named "{source.name}" already exists in that folder',
+                )
+            source.rename(dest)
+        new_rel = str(dest.relative_to(ws_root_resolved))
+        return j(
+            handler,
+            {"ok": True, "old_path": body["path"], "new_path": new_rel},
+        )
+    except (ValueError, FileNotFoundError, PermissionError, OSError) as e:
         return bad(handler, _sanitize_error(e))
 
 

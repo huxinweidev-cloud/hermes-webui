@@ -5594,7 +5594,18 @@ async function loadMemory(force) {
 // Drag and drop
 const wrap=$('composerWrap');let dragCounter=0;
 document.addEventListener('dragover',e=>e.preventDefault());
-document.addEventListener('dragenter',e=>{e.preventDefault();if(e.dataTransfer.types.includes('Files')||e.dataTransfer.types.includes('application/ws-path')){dragCounter++;wrap.classList.add('drag-over');}});
+document.addEventListener('dragenter',e=>{e.preventDefault();
+  const isWsPath=e.dataTransfer.types.includes('application/ws-path');
+  const isFiles=e.dataTransfer.types.includes('Files');
+  if(isFiles||isWsPath){
+    dragCounter++;
+    // Context-aware hint: a workspace-file drag inserts an @path reference;
+    // an OS-file drag attaches the file to the message.
+    const hint=$('dropHintText');
+    if(hint) hint.textContent=isWsPath?'Drop to insert workspace reference':'Drop files to attach';
+    wrap.classList.add('drag-over');
+  }
+});
 document.addEventListener('dragleave',e=>{dragCounter--;if(dragCounter<=0){dragCounter=0;wrap.classList.remove('drag-over');}});
 document.addEventListener('drop',e=>{
   e.preventDefault();dragCounter=0;wrap.classList.remove('drag-over');
