@@ -5234,7 +5234,55 @@ def handle_get(handler, parsed) -> bool:
                 )
             return resp
         except KeyError:
-            # Not a WebUI session -- try CLI store
+            # Not a WebUI session -- try CLI store.
+            # Before synthesising a read-only CLI stub, verify the id was not a
+            # deleted WebUI session. _index.json is the canonical WebUI session
+            # registry; an entry there with a webui, fork, or empty source means the
+            # session once had a sidecar that is now gone. Returning 404 lets the
+            # client self-heal: strip the stale /session/<id> URL and clear
+            # localStorage. Otherwise GET would keep returning 200 from the CLI
+            # stub while POST /api/session/draft and /api/chat/start 404, leaving
+            # the UI bricked (#2782). Genuine CLI-origin sessions (absent from the
+            # index, or tagged with a non-webui source) keep the existing 200 path.
+            _was_webui_session = False
+            if SESSION_INDEX_FILE.exists():
+                try:
+                    _index_entries = json.loads(SESSION_INDEX_FILE.read_text(encoding="utf-8"))
+                    for _ie in _index_entries if isinstance(_index_entries, list) else []:
+                        if _ie.get("session_id") == sid:
+                            # Classify PER source field, not on a collapsed
+                            # `a or b or c` — a legacy CLI/imported row can carry
+                            # is_cli_session:true with BLANK source fields, and
+                            # collapsing-then-defaulting-to-WebUI would wrongly
+                            # 404 it (it should keep its read-only CLI stub).
+                            _srcs = [
+                                str(_ie.get("source_tag") or "").strip().lower(),
+                                str(_ie.get("raw_source") or "").strip().lower(),
+                                str(_ie.get("session_source") or "").strip().lower(),
+                            ]
+                            _explicit = [s for s in _srcs if s]
+                            if any(s in ("webui", "fork") for s in _explicit):
+                                # Explicit WebUI-origin (incl. forks, which
+                                # /api/session/branch stamps session_source="fork")
+                                # — a deleted sidecar bricks identically. 404.
+                                _was_webui_session = True
+                            elif _explicit:
+                                # Explicit non-WebUI source (cli, telegram,
+                                # claude_code, ...) — a genuine foreign session.
+                                # Keep the existing 200 CLI/read-only stub path.
+                                _was_webui_session = False
+                            else:
+                                # All source fields blank: WebUI-origin UNLESS the
+                                # row is a legacy CLI/imported session marked only
+                                # by is_cli_session / read_only.
+                                _is_cli = _ie.get("is_cli_session") is True
+                                _ro = bool(_ie.get("read_only") or _ie.get("is_read_only"))
+                                _was_webui_session = not (_is_cli or _ro)
+                            break
+                except Exception:
+                    pass
+            if _was_webui_session:
+                return bad(handler, "Session not found", 404)
             cli_meta = _lookup_cli_session_metadata(sid)
             msgs = get_cli_session_messages(sid)
             if msgs:
@@ -6441,6 +6489,7 @@ def handle_post(handler, parsed) -> bool:
         with _get_session_agent_lock(body["session_id"]):
             s.title = str(body["title"]).strip()[:80] or "Untitled"
             s.save()
+        _sync_session_title_to_insights(s)
         publish_session_list_changed("session_rename")
         return j(handler, {"session": s.compact()})
 

@@ -3,6 +3,49 @@
 
 ## [Unreleased]
 
+## [v0.51.252] — 2026-06-03 — Release HT (stage-q24 — selection-bleed fix + compatibility docs)
+
+### Fixed
+- The floating "selected-text reply" button no longer lets its own label get caught in a text selection (`user-select:none`), so dragging a selection near the button doesn't bleed into it. (#2481, @rodboev)
+
+### Docs
+- README now has a **Compatibility** section documenting that the WebUI is tested against the matching hermes-agent release and that both should be upgraded together (until the stable agent API #2491 lands). (@rodboev)
+
+## [v0.51.251] — 2026-06-03 — Release HS (stage-q23 — composer ~/ path autocomplete)
+
+### Fixed
+- Typing a `~/` path token in the composer (e.g. `check this file ~/`) now opens a home-directory path-suggestion dropdown, matching the TUI's path completion. It reuses the existing slash-command dropdown (positioning + keyboard nav) and the server's trusted `/api/workspaces/suggest` endpoint, and only replaces the matched path token on selection (surrounding message text is preserved). Slash-command autocomplete still takes precedence for `/`-prefixed input. (#3433, @puneetdixit200)
+
+## [v0.51.250] — 2026-06-03 — Release HR (stage-q22 — Zeus appearance skin)
+
+### Added
+- New **Zeus** appearance skin (Settings → Appearance, or `/theme skin zeus`) — OLED-near-black dark surfaces that keep the default gold accent, for a high-contrast "gold on black" look that no existing skin offered. All visual changes are scoped to `data-skin="zeus"`; it's dark-focused and falls back to the default light palette in light mode. (#3328, @heagandev)
+
+## [v0.51.249] — 2026-06-03 — Release HQ (stage-q21 — auto-expand terminal on output toggle)
+
+### Added
+- New **"Auto-expand terminal on output"** preference (Settings → Preferences, **off by default**). When enabled, the collapsed embedded terminal panel surfaces itself automatically the first time a running command emits output, so long-running command output isn't silently collected behind a collapsed panel. The auto-expand does not steal focus from the composer, and fires once per stream (not per output chunk). Mirrors the existing `simplified_tool_calling` setting pattern; default-off means no behavior change on upgrade. (#2974, @rodboev)
+
+## [v0.51.248] — 2026-06-03 — Release HP (stage-q20 — self-heal deleted WebUI sessions instead of bricking the chat)
+
+### Fixed
+- A WebUI session whose sidecar was deleted server-side (e.g. after `docker compose --force-recreate`) but whose messages still live in `state.db` no longer **bricks the chat** — it looked alive (`GET /api/session` returned 200 from a synthesized CLI stub) while every action failed (`POST /api/session/draft` and `/api/chat/start` returned 404). Now the GET handler consults `_index.json` (the canonical WebUI session registry): if the id was a WebUI-origin session (empty/`webui`/`fork` source) whose sidecar is gone, it returns 404 so the client can self-heal — clearing the saved session id and stripping the stale `/session/<id>` URL — and falls through to the welcome screen. Genuine CLI-origin sessions keep their existing read-only stub. The client self-heal now also covers the mid-session case (the current session's sidecar disappearing), not just boot. (#2782, @rodboev)
+
+## [v0.51.247] — 2026-06-03 — Release HO (stage-q19 — coerce reasoning effort to model-supported levels)
+
+### Fixed
+- A globally-configured reasoning effort (`agent.reasoning_effort`) is now **coerced to the closest level the active model/provider actually supports** before each request, instead of being sent verbatim and rejected. For example `openai-codex` `gpt-5` rejects `max` (now degraded to `xhigh`) and `o1`/`o3`/`o4` only accept `low`/`medium`/`high` (so `max`/`xhigh` degrade to `high`). Coercion only ever steps *down* to a supported level (never escalates), and `none`/unset are preserved. The model/provider effort-capability filter is applied consistently across the heuristic, models.dev metadata, GitHub Copilot, and LM Studio detection paths. (#3505, @franksong2702)
+
+## [v0.51.246] — 2026-06-03 — Release HN (stage-q18 — WebUI rename syncs to agent state.db)
+
+### Fixed
+- Renaming a session in the WebUI now writes the new title through to the agent's `state.db`, so the TUI and CLI no longer keep showing the old name. The `/api/session/rename` handler now calls `_sync_session_title_to_insights()` (gated on the `sync_to_insights` setting) — exactly like the sibling `/api/session/title/regenerate` handler already did. (#3225, @rodboev)
+
+## [v0.51.245] — 2026-06-03 — Release HM (stage-q17 — messaging source badge in chat topbar)
+
+### Fixed
+- Messaging sessions (Telegram, Discord, WeChat, etc.) now show their platform source badge in the **chat-pane topbar**, not just the sidebar. The topbar badge was gated on `is_cli_session`, which is intentionally `false` for messaging sources, so the badge silently disappeared once you opened the session. The gate is removed; a recovered native session whose sidecar stamps `source_label: "WebUI"` is still left un-badged (it isn't a foreign source). (#3338, @rodboev)
+
 ## [v0.51.244] — 2026-06-03 — Release HL (stage-q16 — workspace OS-import drop + composer drop-zone polish)
 
 ### Added
