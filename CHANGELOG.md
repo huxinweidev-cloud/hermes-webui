@@ -7,6 +7,91 @@
 
 - WebUI-launched Hermes Agent browser tools now inherit `HERMES_WEBUI_CAMOFOX_URL` as the default `CAMOFOX_URL` when no explicit `CAMOFOX_URL` is set, so containerized Camofox deployments do not fall back to unreachable `127.0.0.1:9377`.
 
+## [v0.51.245] — 2026-06-03 — Release HM (stage-q17 — messaging source badge in chat topbar)
+
+### Fixed
+- Messaging sessions (Telegram, Discord, WeChat, etc.) now show their platform source badge in the **chat-pane topbar**, not just the sidebar. The topbar badge was gated on `is_cli_session`, which is intentionally `false` for messaging sources, so the badge silently disappeared once you opened the session. The gate is removed; a recovered native session whose sidecar stamps `source_label: "WebUI"` is still left un-badged (it isn't a foreign source). (#3338, @rodboev)
+
+## [v0.51.244] — 2026-06-03 — Release HL (stage-q16 — workspace OS-import drop + composer drop-zone polish)
+
+### Added
+- **Drop OS files/folders onto a specific workspace folder row or breadcrumb segment** to upload into that directory (not only the current directory). OS folder drops are traversed via `webkitGetAsEntry`/`readEntries` and their nested structure is preserved on upload. Composer `@path` drags (#1097), the internal tree-move (#3402), and OS-drop isolation (#3411) are all preserved. (#3402, #3424, @pamnard)
+
+### Fixed
+- The composer drop-zone overlay no longer looks garbled when you drag a workspace file (or OS file) over the footer. Previously the translucent overlay let the textarea, attach/mic icons, and model/profile chips bleed through and collide with the hint text. The overlay is now a clean, fully-opaque box with a single centered, context-aware label — **"Drop to insert workspace reference"** when dragging a workspace file (which inserts an `@path` reference) vs **"Drop files to attach"** for an OS file (which attaches it to the message).
+
+## [v0.51.243] — 2026-06-03 — Release HK (stage-q15 — drag-to-move files within the workspace)
+
+### Added
+- You can now **drag a file or folder in the workspace tree onto another folder row (or a breadcrumb segment) to move it** within the workspace. A new `POST /api/file/move` performs the move server-side, confined to the workspace root (`safe_resolve` on both source and destination, rejects `..` destinations, and refuses to move a folder into itself or a descendant). Name collisions and no-op moves are handled, and the drop handlers use `stopPropagation` so the existing composer `@path` drag (#1097) and OS-file upload-on-drop (#3411) are unchanged. (#3402, #3422, @pamnard)
+
+## [v0.51.242] — 2026-06-03 — Release HJ (stage-q14 — Graphite skin)
+
+### Added
+- New **Graphite** appearance skin — a quiet, neutral-gray "workbench" alternative to the default gold/cream, selectable from Settings → Appearance (and `/theme skin graphite`). All visual changes are scoped to `data-skin="graphite"` so the default appearance is unchanged; the skin ships both light and dark palettes built on the existing CSS-variable token system (no new dependency or build step). Tightens typography, shadows, active-sidebar spacing, and code-block framing, and uses a neutral gray palette rather than an olive-tinted one. (#3440, @t3chn0pr13st)
+
+## [v0.51.241] — 2026-06-03 — Release HI (stage-q13 — New Chat returns to your unsent draft after visiting history)
+
+### Fixed
+- Starting a **New Chat** draft, peeking at a previous conversation, then clicking **New Chat** again no longer loses your unsent prompt. Zero-message New Chat sessions are intentionally hidden from the sidebar, so after you navigated away there was no way back to the empty session that held your draft — New Chat just created another fresh empty session and the draft was stranded. The New Chat entrypoint now remembers the candidate empty draft session (a single `localStorage` pointer) and, before creating a fresh session, re-validates it through `/api/session` and routes back only if it is still a safe empty draft (zero messages, no active stream, no pending message, not worktree-backed, matching profile, and a non-empty server-side `composer_draft`). The composer draft is also flushed to the server before a session switch so typing and immediately navigating away can't drop it. Clearing the draft (e.g. after sending) clears the pointer, so an emptied draft never traps you on New Chat. (#3333, #3471, @starGazerK)
+
+## [v0.51.240] — 2026-06-03 — Release HH (stage-q12 — mobile swipe-up stops streaming auto-scroll)
+
+### Fixed
+- On mobile/touch devices you can now swipe up to stop the auto-scroll-during-streaming behavior. Previously the stream snapped back to the bottom on every token and there was no way to read earlier content while a response was arriving: `_recordNonMessageScrollIntent()` only detected upward intent on the wheel path (`typeof e.deltaY === 'number'`), but touch events carry no `deltaY`, so a finger swipe never unpinned the view. The handler now tracks the `touchstart` Y position and treats a `touchmove` that moves the finger up by >8px as upward-scroll intent — the same authoritative unpin (`_messageUserUnpinned`) the wheel path uses — so auto-follow stops until you scroll back to the bottom or tap the ↓ button. (#3470, @cnogrin)
+
+## [v0.51.239] — 2026-06-03 — Release HG (stage-q10 — ignore SIGPIPE so a dropped client can't kill the server)
+
+### Fixed
+- The server no longer dies silently when a client drops the connection mid-response. Python's default action for `SIGPIPE` is `Term`, so a single broken-pipe `socket.send()` in any `ThreadingHTTPServer` worker thread (browser tab closed mid-stream, network drop, mobile backgrounding, a dropped long-poll, an `/api/updates/check` timeout) could terminate the entire WebUI process — no exception, no log, no `/health` response. `server.py` now sets `SIGPIPE` to `SIG_IGN` at import time: the kernel surfaces the broken pipe as a catchable `BrokenPipeError`, the per-request handler unwinds, the connection closes, and the server keeps serving. The handler is `getattr`-guarded so it is a no-op on Windows, where `SIGPIPE` does not exist (preserves native-Windows support, #1952) (salvaged from #3407, @PatrickNoFilter).
+
+## [v0.51.238] — 2026-06-03 — Release HF (stage-q9 — New Conversation hits the fast path on cold start)
+
+### Fixed
+- Clicking **New Conversation** on a cold start no longer hangs for 3–4s on a catalog rebuild. `POST /api/session/new`'s fast path (`_resolve_compatible_session_model_state`) returns immediately only when the request carries both a `model` and a truthy `model_provider`; on a cold/unhydrated dropdown the client sent `model_provider=null`, so the request fell into `get_available_models()` and rebuilt the full catalog (the "first click slow, later clicks fast" asymmetry from #2518). `newSession()` (`static/sessions.js`) now falls back to `window._activeProvider` (then the previous session's `model_provider`) when the dropdown option carries no provider, so the first click takes the fast path too. **Two guards keep this safe:** (1) a slash-qualified (`gemini/…`) or `@provider:model` slug already carries a foreign provider namespace from a prior backend, so the fallback deliberately leaves `model_provider=null` for those; (2) even a *bare* model can carry a known family prefix (`gpt`→openai, `claude`→anthropic, `gemini`→google) — if that family maps to a different provider than the fallback we'd attach, `model_provider` is left null too. Both cases preserve the server slow-path's family-aware cross-provider repair rather than silently re-pointing the new session at the wrong backend (#2518 follow-up, @franksong2702).
+
+## [v0.51.237] — 2026-06-03 — Release HE (stage-q8 — reconcile early-cancel against live worker state)
+
+### Fixed
+- Cancelling a live turn immediately after sending now reliably stops the worker and settles the session to a cancelled state, instead of leaving the UI showing a running spinner over a blank session page. The bug was an early-cancel race: the browser SSE could detach (removing the entry from `STREAMS`) before the worker was fully reflected there, so `cancel_stream()` returned early and never interrupted the agent. `cancel_stream()` now falls back to the live active-run registry (`ACTIVE_RUNS`) and the session agent cache when `STREAMS` has already detached, so the worker still receives `interrupt("Cancelled by user")` and the session is cleaned up. Relatedly, `/api/session` now reports run-journal active state from the live active-run registry rather than treating any persisted `active_stream_id` as proof the worker is still alive (#3475, @franksong2702).
+
+## [v0.51.236] — 2026-06-03 — Release HD (stage-q7 — native Windows support for bootstrap and terminal)
+
+### Added
+- Native Windows support for `bootstrap.py` and the embedded terminal (#1952). Hermes WebUI already ran on Windows when invoked as `python server.py` directly; this unblocks the supported `python bootstrap.py` path. `api/terminal.py` no longer hard-imports the POSIX-only `fcntl`/`termios`/`select` at module load — they're guarded behind `_TERMINAL_SUPPORTED = sys.platform != "win32"`, and the embedded-terminal entry points raise `NotImplementedError` (or no-op) on Windows, following the existing optional-feature guard pattern (`api/turn_journal.py`, `api/providers.py`). The bootstrap native-Windows block becomes a warning instead of a hard `RuntimeError`; auto-install (which shells out to `/bin/bash`) still errors clearly on native Windows (WSL is unaffected), and the foreground launch path uses `subprocess.Popen` + exit on Windows (where `os.execv` spawns rather than replaces the process, orphaning it from a supervisor) instead of `os.execv`. POSIX behavior is unchanged on every path (#1952, @rodboev).
+
+## [v0.51.235] — 2026-06-03 — Release HC (stage-q5 — no duplicate transcript replay on repeated questions after compression)
+
+### Fixed
+- The chat transcript no longer accumulates duplicate messages after multiple context-compression cycles when the user asks similar (or identical) questions across turns. `_find_current_user_turn` (`api/streaming.py`) located the slice point for the current turn's new messages by scanning `result_messages` for the user text — but after compression `result_messages` carries the full conversation history, so a *first*-match scan returned an **older** turn's index, making the merge re-append the entire replayed history from that point (observed: a 137-message session where 89 were duplicate replays, burying the real new messages). It now returns the **last** matching user turn, so the candidate slice begins at the current turn and the replayed history is not re-appended. To stay correct when the agent loop appends synthetic `role:"user"` continuation prompts (e.g. "Continue" / empty-recovery nudges) after the real turn, an exact (strong) match is preferred over a later substring (weak) match — so a synthetic continuation can't anchor the merge past the real turn and drop the assistant/tool output in between. Behavior on the no-match path (fall back to the last user index) is unchanged (#3468, @jasonjcwu). A regression test pins the unit behavior, the strong-beats-later-weak invariant, and the end-to-end no-duplicate-replay invariant (each verified to fail against the pre-fix logic).
+
+## [v0.51.234] — 2026-06-03 — Release HB (stage-q4 — duplicate-instance startup guard + remote-terminal workspace paths)
+
+### Fixed
+- The server now refuses to start when a live instance is already responding on the configured port, instead of silently sharing it (a Windows/macOS hazard where `SO_REUSEADDR` semantics let two processes bind 8787 at once, #3289). Rather than globally disabling `SO_REUSEADDR` (which would brick legitimate fast restarts — `ctl.sh restart` and the `os.execv` self-update path rebind immediately and would hit the TIME_WAIT window), startup now runs a live-listener probe (`_abort_if_already_serving`): a TCP connect + `GET /health` with a 2s timeout. A live instance answers and startup aborts with a clear message; a dying instance whose socket still lingers in the kernel backlog accepts the connection but never responds, so the probe times out and startup proceeds — preserving fast restart. On Windows, `SO_EXCLUSIVEADDRUSE` is set in a `server_bind()` override to get true exclusive binding (POSIX keeps the inherited `allow_reuse_address = True`) (#3289, @rodboev).
+- Remote/SSH terminal profiles can now use target-side workspace paths that don't exist on the WebUI host. Workspace validation/resolution previously `stat()`-ed every path against the WebUI server's local filesystem, so a `terminal.cwd` (or session workspace) living on the remote target was rejected as nonexistent. For profiles whose terminal backend is non-local, paths **under the configured `terminal.cwd`** now pass validation without a server-local existence check, and stale server-local `last_workspace` values are ignored unless they fall under the remote cwd. Local profiles are unchanged — the bypass only fires for remote backends and only for paths contained within `terminal.cwd` (#3486, @dso2ng).
+
+## [v0.51.233] — 2026-06-03 — Release HA (stage-q3 — session-truncate keep_count guard against silent transcript loss)
+
+### Fixed
+- `POST /api/session/truncate` no longer silently wipes a session transcript on a negative `keep_count`, and no longer returns an HTTP 500 on a non-numeric one. `keep_count` fed a bare `int()` straight into the destructive `s.messages = s.messages[:keep]` slice followed by `s.save()`, so a negative value sliced as `messages[:-N]` — **deleting the most recent N messages and persisting the result to disk** (e.g. `keep_count=-5` on a 3-message session wiped the entire transcript and returned HTTP 200). `keep_count` is now validated before the slice — non-integer → `400 "keep_count must be an integer"`, negative → `400 "keep_count must be non-negative"` — mirroring the guard the sibling `/api/session/branch` handler already applies (`keep_count=0` keeps its existing "clear all messages" meaning) (#3472, @Mubashirrrr).
+
+## [v0.51.232] — 2026-06-03 — Release GZ (stage-q2 — cron-endpoint query-param guards + Japanese locale translations)
+
+### Fixed
+- The cron output (`/api/crons/output`) and cron recent (`/api/crons/recent`) endpoints no longer return a confusing HTTP 500 on a malformed numeric query param. A non-numeric `limit` (e.g. `?limit=abc`) or `since` previously let `int()`/`float()` raise `ValueError` up to the top-level handler; both are now parsed defensively (falling back to their defaults). The cron-output `limit` is also clamped to `[1, 500]` so a negative value can't reach the newest-first `files[:limit]` slice as `files[:-n]` (which would drop the oldest entries — or return an empty list when the magnitude exceeds the count — instead of the newest outputs), mirroring the guard `_handle_cron_run_detail` already uses (#3473, @Mubashirrrr).
+
+### Changed
+- Japanese (`ja`) locale: translated 80 previously-untranslated UI strings (MCP server controls, tool summaries, and related toasts) from their English fallbacks to Japanese, with all `${…}` interpolation placeholders preserved. No locale keys added or removed (#3480, @koshikai).
+
+## [v0.51.231] — 2026-06-03 — Release GY (stage-q1 — /model extras-tail resolution + plugins-tab auto-hide + search-depth guard + symlink-home suggestions)
+
+### Fixed
+- `/model <name>` can now select a model that lives in the **truncated `extra_models` tail** of a large provider catalog, completing the #3368 fix that v0.51.229 left half-done. On Nous-style catalogs with >25 models the picker renders only a featured subset as `<option>` entries and pushes the rest into `extra_models`; the `/model` resolver previously matched only against the rendered `sel.options`, so a bare model living only in the extras tail (e.g. `xiaomi/mimo-v2.5` alongside the featured `xiaomi/mimo-v2.5-pro`) was un-selectable and produced a misleading "did you mean -pro?" toast. A new `_buildModelCandidates()` (`static/commands.js`) now builds the candidate set from the full `/api/models` catalog (featured `models` + `extra_models`) — the same complete list the CLI and `/model` autocomplete use — and an extras-only winner is injected via `_ensureModelOptionInDropdown()` before selection so the correct `model` + `model_provider` persist end-to-end. The #3437 tier-guard is fully preserved: a genuinely off-catalog versioned name still refuses to snap to a `-pro`/`-flash` tier and shows the suggestion toast (#3368, @nesquena-hermes; with @garyd9, confirmation @yutaotie).
+- The **Plugins** tab in Settings is now auto-hidden when no plugins are installed (`/api/plugins` returns `empty: true`), and deep-linking to the hidden plugins pane falls back to the Conversation section. The tab reappears automatically when plugins are detected (#3457, @pix0127).
+- `GET /api/sessions/search?...&depth=<x>` no longer returns a confusing HTTP 500 on a non-numeric `depth` (e.g. `?depth=deep`) and no longer silently excludes the newest messages on a negative `depth` (which sliced as `messages[:-n]`). `depth` is now parsed defensively and clamped to `>= 0` (0 keeps its existing "search the full transcript" meaning), mirroring the guard sibling handlers already use (#3474, @Mubashirrrr).
+- Workspace path autocomplete now expands `~/` suggestions even when the WebUI process home path is a symlink or alias of the trusted home root, so prefixes like `~/Doc` still list home-directory matches instead of returning an empty dropdown. The typed `~` target is now resolved before the trust comparison (#3433, @sjh9714).
+
 ## [v0.51.230] — 2026-06-03 — Release GX (stage-p14 — extract <think> blocks to m.reasoning + LLM Wiki last-writer)
 
 ### Fixed
