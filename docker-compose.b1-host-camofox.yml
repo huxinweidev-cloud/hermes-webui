@@ -14,7 +14,7 @@ services:
       context: .
       dockerfile: Dockerfile
       args:
-        HERMES_VERSION: v0.51.137-b1-host-camofox
+        HERMES_VERSION: v0.51.245-b1-host-camofox
     restart: unless-stopped
     ports:
       - "127.0.0.1:8787:8787"
@@ -31,6 +31,10 @@ services:
       - /home/ubuntu/.local/bin/hermes:/home/ubuntu/.local/bin/hermes:ro
       # Explicit least-privilege workspace. Add more project mounts only when needed.
       - /opt/hermes-webui-nesquena/workspace:/workspace:rw
+      # Shared image-generation output directory. Keep the container path identical
+      # to the profile .env value so Hermes Agent's profile env cannot override
+      # the compose env to an unmounted host-only path.
+      - /home/ubuntu/image:/home/ubuntu/image:rw
     env_file:
       - .env.b1-host-camofox
     environment:
@@ -38,6 +42,7 @@ services:
       WANTED_GID: "1001"
       HOME: /home/hermeswebui
       HERMES_HOME: /home/hermeswebui/.hermes
+      HERMES_IMAGE_OUTPUT_DIR: /home/ubuntu/image
       HERMES_WEBUI_AGENT_DIR: /home/hermeswebui/.hermes/hermes-agent
       HERMES_WEBUI_PYTHON: /home/hermeswebui/.hermes/hermes-agent/venv/bin/python
       HERMES_WEBUI_HOST: 0.0.0.0

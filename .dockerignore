@@ -5,3 +5,9 @@ __pycache__
 *.pyo
 tests/
 .env*
+
+# Local agent/deployment scratch files should never be baked into the WebUI image.
+.hermes/
+docker-compose.camofox-ghcr.yml
+scripts/import_state_db_sessions_to_webui.py
+scripts/import_webui_sessions_to_state_db.py
