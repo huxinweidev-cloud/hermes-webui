@@ -1898,13 +1898,13 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     const byTid=new Map();
     liveCalls.forEach((tc,idx)=>{
       if(!tc||typeof tc!=='object') return;
-      const tid=tc.tid||tc.id||tc.tool_call_id||tc.call_id||'';
+      const tid=tc.tid||tc.id||tc.tool_call_id||tc.tool_use_id||tc.call_id||'';
       if(tid&&!byTid.has(tid)) byTid.set(tid,{tc,idx});
     });
     const used=new Set();
     return (rawCalls||[]).map((raw,idx)=>{
       const next={...(raw||{}),done:true};
-      const tid=next.tid||next.id||next.tool_call_id||next.call_id||'';
+      const tid=next.tid||next.id||next.tool_call_id||next.tool_use_id||next.call_id||'';
       let matchEntry=tid?byTid.get(tid):null;
       if(!matchEntry){
         const name=next.name||((next.function||{}).name)||'';
@@ -2463,7 +2463,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
   }
 
   function _liveToolTid(d, activityBurstId, activitySegmentSeq){
-    const explicit=String(d&&d.tid||'').trim();
+    const explicit=String(d&&(d.tid||d.id||d.tool_call_id||d.tool_use_id||d.call_id)||'').trim();
     if(explicit) return explicit;
     return `live-${activeSid}-${_hashString(_toolCallSignature(d,activityBurstId,activitySegmentSeq))}`;
   }
@@ -2491,7 +2491,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
         const candidate=toolCalls[i];
         if(!candidate||typeof candidate!=='object') continue;
         if(!allowDone&&candidate.done===true) continue;
-        const candidateTid=String(candidate.tid||candidate.id||candidate.tool_call_id||candidate.call_id||'');
+        const candidateTid=String(candidate.tid||candidate.id||candidate.tool_call_id||candidate.tool_use_id||candidate.call_id||'');
         if(candidateTid&&candidateTid===wantedTid) return i;
       }
     }
@@ -2561,7 +2561,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     if(!Array.isArray(inflight.toolCalls)) inflight.toolCalls=[];
     if(!Array.isArray(inflight.messages)) inflight.messages=[...(inflight.messages||[])];
 
-    const explicitTid=String(d&&d.tid||'').trim();
+    const explicitTid=String(d&&d.tid||d&&d.id||d&&d.tool_call_id||d&&d.tool_use_id||d&&d.call_id||'').trim();
     const isComplete=phase==='complete';
     let signature=_toolCallSignature(d,current.burstId,current.segmentSeq);
     let index=-1;
@@ -4136,44 +4136,19 @@ async function respondApproval(choice) {
 function startApprovalPolling(sid) {
   stopApprovalPolling();
   _approvalPollingSessionId = sid || null;
-  // ── SSE (preferred): long-lived connection, server pushes instantly ──
-  try {
-    const es = new EventSource(new URL('api/approval/stream?session_id=' + encodeURIComponent(sid), document.baseURI || location.href).href);
-    let _fallbackActive = false;
 
-    es.addEventListener('initial', e => {
-      const d = JSON.parse(e.data);
-      if (d.pending) { showApprovalForSession(sid, d.pending, d.pending_count || 1); }
-      else { _clearApprovalPendingForSession(sid); _hideApprovalCardIfOwner(sid); }
-    });
-
-    es.addEventListener('approval', e => {
-      const d = JSON.parse(e.data);
-      if (d.pending) { showApprovalForSession(sid, d.pending, d.pending_count || 1); }
-      else { _clearApprovalPendingForSession(sid); _hideApprovalCardIfOwner(sid); }
-    });
-
-    es.onerror = () => {
-      // SSE failed — fall back to HTTP polling (3s interval)
-      if (_fallbackActive) return;
-      _fallbackActive = true;
-      try { es.close(); } catch(_){}
-      _startApprovalFallbackPoll(sid);
-    };
-
-    // If the session changes or stops being busy, close the SSE.
-    // We detect this via a periodic check (cheap — no network request).
-    _approvalSSEHealthTimer = setInterval(() => {
-      if (!S.busy || !S.session || S.session.session_id !== sid) {
-        stopApprovalPolling(); _hideApprovalCardIfOwner(sid, true);
-      }
-    }, 5000);
-
-    _approvalEventSource = es;
-  } catch(_e) {
-    // EventSource constructor failed — use polling directly
-    _startApprovalFallbackPoll(sid);
-  }
+  // Use HTTP polling instead of SSE to avoid browser connection pool exhaustion.
+  // Browsers limit to 6 concurrent HTTP connections per origin over HTTP/1.1.
+  // With 6 persistent SSE streams (sessions/events, gateway/stream,
+  // session/stream, approval/stream, clarify/stream, chat/stream), the pool
+  // fills and all fetch() requests queue indefinitely. The server responds
+  // normally (curl works), but the browser has no available sockets.
+  //
+  // This was introduced in v0.51.340 when /api/session/stream was added as
+  // the 6th persistent SSE connection. Until we multiplex streams or serve
+  // SSE from a separate origin, use HTTP polling to free 2 connection slots.
+  // (1.5-second interval, acceptable tradeoff)
+  _startApprovalFallbackPoll(sid);
 }
 
 let _approvalEventSource = null;
@@ -4181,7 +4156,10 @@ let _approvalSSEHealthTimer = null;
 let _approvalPollingSessionId = null;
 
 function _startApprovalFallbackPoll(sid) {
-  _approvalPollTimer = setInterval(async () => {
+  // Run one tick immediately so a session already blocked on a pending approval
+  // shows its card instantly (the removed SSE 'initial' event used to do this);
+  // then poll on the 1500ms cadence. (#3913 SHOULD-FIX)
+  const _tick = async () => {
     if (!S.busy || !S.session || S.session.session_id !== sid) {
       stopApprovalPolling(); _hideApprovalCardIfOwner(sid, true); return;
     }
@@ -4193,7 +4171,9 @@ function _startApprovalFallbackPoll(sid) {
       else { _clearApprovalPendingForSession(sid); _hideApprovalCardIfOwner(sid); }
     } catch(e) { /* ignore poll errors */ }
     finally { _approvalFallbackPollInFlight = false; }
-  }, 1500);  // matches the v0.50.247 polling cadence so degraded-mode users see the same responsiveness
+  };
+  _approvalPollTimer = setInterval(_tick, 1500);  // matches the v0.50.247 polling cadence so degraded-mode users see the same responsiveness
+  _tick();
 }
 
 function stopApprovalPollingForSession(sid) {
@@ -4879,64 +4859,26 @@ function startClarifyPolling(sid) {
   _clarifyPollingSessionId = sid || null;
   _clarifyMissingEndpointWarned = false;
 
-  // SSE primary path: long-lived connection pushes events instantly.
-  try {
-    _clarifyEventSource = new EventSource(new URL('api/clarify/stream?session_id=' + encodeURIComponent(sid), document.baseURI || location.href).href);
-  } catch(e) {
-    _startClarifyFallbackPoll(sid);
-    return;
-  }
-
-  _clarifyEventSource.addEventListener('initial', function(ev) {
-    try {
-      var d = JSON.parse(ev.data);
-      if (d.pending) { showClarifyForSession(sid, d.pending); }
-      else { _clearClarifyPendingForSession(sid); _hideClarifyCardIfOwner(sid, false, 'expired'); }
-    } catch(e) {}
-  });
-
-  _clarifyEventSource.addEventListener('clarify', function(ev) {
-    try {
-      var d = JSON.parse(ev.data);
-      if (d.pending) { showClarifyForSession(sid, d.pending); }
-      else { _clearClarifyPendingForSession(sid); _hideClarifyCardIfOwner(sid, false, 'expired'); }
-    } catch(e) {}
-  });
-
-  _clarifyEventSource.onerror = function() {
-    if (_clarifyEventSource) { try { _clarifyEventSource.close(); } catch(_){} _clarifyEventSource = null; }
-    if (_clarifyHealthTimer) { clearInterval(_clarifyHealthTimer); _clarifyHealthTimer = null; }
-    _startClarifyFallbackPoll(sid);
-  };
-
-  // Stale-detector: track last event timestamp; only reconnect if no event
-  // (initial or clarify) has arrived in 60s. The server sends a keepalive
-  // comment line every 30s but EventSource silently consumes those; we only
-  // bump lastEventAt on actual application events. With no real events for
-  // 60s on a long-lived clarify connection the server is effectively silent
-  // and a reconnect is the safe move.
+  // Use HTTP polling instead of SSE to avoid browser connection pool exhaustion.
+  // Browsers limit to 6 concurrent HTTP connections per origin over HTTP/1.1.
+  // With 6 persistent SSE streams (sessions/events, gateway/stream,
+  // session/stream, approval/stream, clarify/stream, chat/stream), the pool
+  // fills and all fetch() requests queue indefinitely. The server responds
+  // normally (curl works), but the browser has no available sockets.
   //
-  // Without the lastEventAt gate the original PR force-reconnected every 60s
-  // regardless of activity, which churned one TCP/SSE setup per minute per
-  // active session. (Opus pre-release review of v0.50.249.)
-  let _lastClarifyEventAt = Date.now();
-  const _markClarifyEvent = () => { _lastClarifyEventAt = Date.now(); };
-  _clarifyEventSource.addEventListener('initial', _markClarifyEvent);
-  _clarifyEventSource.addEventListener('clarify', _markClarifyEvent);
-  _clarifyHealthTimer = setInterval(function() {
-    if (Date.now() - _lastClarifyEventAt < 60000) return;
-    if (_clarifyEventSource) {
-      try { _clarifyEventSource.close(); } catch(_){}
-      _clarifyEventSource = null;
-    }
-    clearInterval(_clarifyHealthTimer); _clarifyHealthTimer = null;
-    startClarifyPolling(sid);
-  }, 60000);
+  // This was introduced in v0.51.340 when /api/session/stream was added as
+  // the 6th persistent SSE connection. Until we multiplex streams or serve
+  // SSE from a separate origin, use HTTP polling to free 2 connection slots.
+  // (3-second interval, acceptable tradeoff)
+  _startClarifyFallbackPoll(sid);
 }
 
 function _startClarifyFallbackPoll(sid) {
   _clarifyPollingSessionId = sid || null;
-  _clarifyFallbackTimer = setInterval(async () => {
+  // Run one tick immediately so a session already blocked on a pending clarify
+  // shows its card instantly (the removed SSE 'initial' event used to do this);
+  // then poll on the 3000ms cadence. (#3913 SHOULD-FIX)
+  const _tick = async () => {
     if (!S.session || S.session.session_id !== sid) {
       stopClarifyPolling(); _hideClarifyCardIfOwner(sid, true, 'session'); return;
     }
@@ -4959,7 +4901,9 @@ function _startClarifyFallbackPoll(sid) {
     } finally {
       _clarifyFallbackPollInFlight = false;
     }
-  }, 3000);
+  };
+  _clarifyFallbackTimer = setInterval(_tick, 3000);
+  _tick();
 }
 
 function stopClarifyPollingForSession(sid) {
