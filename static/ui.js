@@ -77,24 +77,44 @@ async function _probeOfflineRecovery(){
   if(_offlineHealthProbePromise)return _offlineHealthProbePromise;
   _offlineHealthProbePromise=(async()=>{
     const fetcher=_offlineRawFetch||window.fetch.bind(window);
+    // Bound the probe so a black-hole network (connected, server hung, packets
+    // dropped) can't delay the banner past a few seconds — the probe now gates
+    // the initial banner display on the offline-event/startup paths.
+    let ctrl=null,timer=null;
+    try{ctrl=(typeof AbortController!=='undefined')?new AbortController():null;}catch(_){ctrl=null;}
+    if(ctrl)timer=setTimeout(()=>{try{ctrl.abort();}catch(_){}},3000);
     try{
-      const res=await fetcher(_offlineHealthUrl(),{cache:'no-store',credentials:'include'});
+      const opts={cache:'no-store',credentials:'include'};
+      if(ctrl)opts.signal=ctrl.signal;
+      const res=await fetcher(_offlineHealthUrl(),opts);
       return !!(res&&res.ok);
     }catch(_){return false;}
+    finally{if(timer)clearTimeout(timer);}
   })();
   try{return await _offlineHealthProbePromise;}
   finally{_offlineHealthProbePromise=null;}
+}
+async function _showOfflineBannerIfProbeFails(reason){
+  const visibleAtStart=_offlineVisible;
+  if(visibleAtStart)_setOfflineChecking(true);
+  const ok=await _probeOfflineRecovery();
+  if(visibleAtStart)_setOfflineChecking(false);
+  if(ok){
+    if(_offlineVisible){_stopOfflineProbeTimer();await _recoverFromOfflineSoftly();}
+    return true;
+  }
+  showOfflineBanner(reason||(_browserReportsOnline()?'network':'browser'));
+  return false;
 }
 async function checkOfflineRecoveryNow(){
   if(_offlineProbePromise)return _offlineProbePromise;
   _offlineProbePromise=(async()=>{
     if(!_offlineVisible)return false;
-    if(!_browserReportsOnline()){showOfflineBanner('browser');return false;}
     _setOfflineChecking(true);
     const ok=await _probeOfflineRecovery();
     _setOfflineChecking(false);
-    if(ok){_stopOfflineProbeTimer();await _recoverFromOfflineSoftly();return true;}
-    showOfflineBanner('network');
+    if(ok){if(!_offlineVisible)return true;_stopOfflineProbeTimer();await _recoverFromOfflineSoftly();return true;}
+    showOfflineBanner(_browserReportsOnline()?'network':'browser');
     return false;
   })();
   try{return await _offlineProbePromise;}
@@ -153,17 +173,18 @@ function _patchOfflineFetch(){
   window.fetch=async function(...args){
     try{return await _offlineRawFetch(...args);}
     catch(e){
-      if(!_browserReportsOnline())showOfflineBanner('browser');
-      else if(e instanceof TypeError&&!_isAbortError(e))void _probeOfflineRecovery().then(ok=>{if(!ok)showOfflineBanner('network');});
+      if(!_isAbortError(e)&&(e instanceof TypeError||!_browserReportsOnline())){
+        void _showOfflineBannerIfProbeFails(_browserReportsOnline()?'network':'browser');
+      }
       throw e;
     }
   };
 }
 function initOfflineMonitor(){
   _patchOfflineFetch();
-  window.addEventListener('offline',()=>showOfflineBanner('browser'));
+  window.addEventListener('offline',()=>{void _showOfflineBannerIfProbeFails('browser');});
   window.addEventListener('online',()=>{if(_offlineVisible)checkOfflineRecoveryNow();});
-  if(!_browserReportsOnline())showOfflineBanner('browser');
+  if(!_browserReportsOnline())void _showOfflineBannerIfProbeFails('browser');
 }
 if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',initOfflineMonitor,{once:true});
 else initOfflineMonitor();
@@ -1637,10 +1658,11 @@ function _selectedModelOption(){
 
 function _normalizeConfiguredModelKey(modelId){
   let s=String(modelId||'').trim().toLowerCase();
-  // Strip @provider: prefix (e.g., @custom:jingdong:GLM-5 -> GLM-5).
+  let strippedAtProvider=false;
+  // Strip @provider: prefix (e.g., @custom:jingdong:GLM-5 -> jingdong:GLM-5).
   // Defensive: trailing-colon / trailing-slash falls back to the original key
   // so malformed configs don't collapse distinct ids to '' (matches backend _norm_model_id).
-  if(s.startsWith('@')&&s.includes(':')){const last=s.split(':').pop();s=last||s;}
+  if(s.startsWith('@')&&s.includes(':')){const ci=s.indexOf(':',1);const cand=s.slice(ci+1);strippedAtProvider=!!cand;s=cand||s;}
   // Skip slash-based stripping for URI-scheme IDs (e.g. gpt://folder/model)
   // whose slashes are path separators, not provider delimiters (#3429).
   const _hasScheme=/^[a-z][a-z0-9+.-]*:\/\//i.test(s);
@@ -1650,7 +1672,7 @@ function _normalizeConfiguredModelKey(modelId){
     // key variants like 'custom:llm-proxy/opencode_go/deepseek-v4-pro' and the
     // bare 'opencode_go/deepseek-v4-pro' produce different normalized keys and
     // aren't deduped in the configured section (#3360).
-    if(s.includes('/')&&s.indexOf(':')!==-1&&s.indexOf(':')<s.indexOf('/')){
+    if(!strippedAtProvider&&s.includes('/')&&s.indexOf(':')!==-1&&s.indexOf(':')<s.indexOf('/')){
       s=s.slice(s.indexOf('/')+1)||s;
     }
     // Strip only the first slash-segment (provider prefix), preserving any
