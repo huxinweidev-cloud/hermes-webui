@@ -787,6 +787,20 @@ class Session:
                 except (json.JSONDecodeError, ValueError):
                     existing_msg_count = -1  # corrupt → always back up
                 incoming_msg_count = len(self.messages or [])
+                if (
+                    existing_msg_count > 0
+                    and incoming_msg_count == 0
+                    and (self.active_stream_id or self.pending_user_message)
+                ):
+                    logger.warning(
+                        "refusing to overwrite session %s messages with empty active/pending snapshot "
+                        "(existing=%s, incoming=%s, stream=%s)",
+                        self.session_id,
+                        existing_msg_count,
+                        incoming_msg_count,
+                        self.active_stream_id,
+                    )
+                    return
                 if existing_msg_count > incoming_msg_count:
                     bak_path = self.path.with_suffix('.json.bak')
                     # SHOULD-FIX #2 (Opus): atomic write via tmp+replace,
@@ -2700,6 +2714,13 @@ def _prefer_fuller_snapshots_for_sidebar(sessions: list[dict]) -> list[dict]:
         # Showing both is less tidy than hiding one, but it preserves every
         # reachable message. Tidy and wrong is how users start doubting reality.
         if newest_visible_ts > snapshot_ts:
+            continue
+
+        messageful_visible = [
+            session for session in visible
+            if _sidebar_message_count(session) > 0
+        ]
+        if len(messageful_visible) > 1:
             continue
 
         continuation_ids_to_hide.update(

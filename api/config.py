@@ -2187,7 +2187,15 @@ def resolve_model_provider(model_id: str) -> tuple:
         # If prefix does NOT match config provider, the user picked a cross-provider model
         # from the OpenRouter dropdown (e.g. config=anthropic but picked openai/gpt-5.4-mini).
         # In this case always route through openrouter with the full provider/model string.
-        if prefix in _PROVIDER_MODELS and prefix != config_provider:
+        # Exception (#4210): a custom provider (bare ``custom`` or named ``custom:<slug>``)
+        # is a vendor-routing proxy, not a first-party provider — its model ids commonly
+        # contain a known-provider prefix that the proxy uses for upstream routing, not
+        # an OpenRouter dropdown selection. Keep the request on the custom provider; the
+        # base_url-set sibling of this exception lives earlier in the ``config_base_url``
+        # branch (#3872).
+        _cp_lower_cross = (config_provider or "").strip().lower()
+        _is_custom_cross = _cp_lower_cross == "custom" or _cp_lower_cross.startswith("custom:")
+        if prefix in _PROVIDER_MODELS and prefix != config_provider and not _is_custom_cross:
             return model_id, "openrouter", None
 
     return model_id, config_provider, config_base_url
@@ -6497,7 +6505,7 @@ _SETTINGS_DEFAULTS = {
     "hide_empty_state_suggestions": False,  # hide the default new-chat suggestion buttons
     "show_tps": False,  # show tokens-per-second chip in assistant message headers
     "fade_text_effect": False,  # animate newly streamed words with a lightweight fade-in effect
-    "show_cli_sessions": False,  # merge CLI sessions from state.db into the sidebar
+    "show_cli_sessions": True,  # merge CLI/TUI/messaging sessions from state.db into the sidebar by default (#3988); established installs are grandfathered OFF by the load_settings backfill
     "show_cron_sessions": False,  # surface cron sessions in the sidebar (subordinate to show_cli_sessions)
     "show_previous_messaging_sessions": False,  # show older Telegram/Discord/etc. reset segments
     "sync_to_insights": False,  # mirror WebUI token usage to state.db for /insights
@@ -6639,6 +6647,26 @@ def load_settings() -> dict:
                         if k not in _SETTINGS_LEGACY_DROP_KEYS
                     }
                 )
+                # Grandfather established installs OFF for show_cli_sessions (#3988).
+                # The default flipped True so NEW users see CLI/TUI/messaging
+                # sessions without hunting for the toggle — but an existing user
+                # who never opted in should not have their sidebar silently change.
+                # Treat the install as established (and pin the old False default)
+                # when show_cli_sessions is absent AND the file already carries
+                # real user state — either onboarding was completed, or some
+                # setting OTHER than a not-yet-completed onboarding flag has been
+                # persisted. Keying on "has saved user state" (not just
+                # onboarding_completed) also covers a CLI-configured user who
+                # tweaked a WebUI setting before running the wizard. A genuinely
+                # new / still-mid-onboarding file falls through to the True default.
+                _established_keys = [
+                    k for k in stored
+                    if k not in ("show_cli_sessions", "onboarding_completed")
+                ]
+                if "show_cli_sessions" not in stored and (
+                    bool(stored.get("onboarding_completed")) or _established_keys
+                ):
+                    settings["show_cli_sessions"] = False
         except Exception:
             logger.debug("Failed to load settings from %s", SETTINGS_FILE)
     settings["theme"], settings["skin"] = _normalize_appearance(

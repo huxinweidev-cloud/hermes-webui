@@ -3,6 +3,71 @@
 
 ## [Unreleased]
 
+## [v0.51.432] — 2026-06-15 — Release OS (TUI sessions discoverable in the sidebar)
+
+### Fixed
+
+- **TUI sessions now show up in the sidebar like CLI sessions do.** The session source-classification only recognized `cli` (and friends), so `tui`-sourced sessions weren't tagged as CLI-origin and could be filtered out or mislabeled. `tui` is now treated alongside `cli` everywhere the source is classified, and a TUI continuation tip keeps the navigation pointed at the latest tip with its visible TUI title (rather than an opaque compression-snapshot title), so the newest TUI conversation is findable by name. (#4213)
+
+## [v0.51.431] — 2026-06-15 — Release OR (make request logging non-fatal)
+
+### Fixed
+
+- **A closed or redirected stdout/stderr stream can no longer abort an HTTP response before it's sent.** Request/access logging and request-error logging now route through a small guarded print helper, so if agent or tool code redirects or closes the process-wide output streams in another thread, the log write is swallowed instead of raising mid-response. Real handler errors are unaffected — the error message and traceback are still built and still surface a 500; only the log I/O is guarded, and `KeyboardInterrupt`/`SystemExit` still propagate. (#4188)
+
+## [v0.51.430] — 2026-06-15 — Release OQ (session-list-changed events carry the changed session id)
+
+### Changed
+
+- **Session-list invalidation events can now carry the specific `session_id` that changed.** `publish_session_list_changed(...)` and the `/api/sessions/events` SSE payload gained an optional `session_id` (defaulting to none, so the broad-refresh behavior is unchanged and backward-compatible). The frontend uses it to tell whether an event targets the currently-open session, refining the refresh signal instead of always doing a broad sidebar refresh. Profile scoping and the legacy one-argument publish shape are preserved. (#4221)
+
+## [v0.51.429] — 2026-06-15 — Release OP (preserve multiple messageful imported/CLI sessions in the sidebar)
+
+### Fixed
+
+- **Multiple imported / CLI sessions that share a lineage with a fuller pre-compression snapshot are no longer collapsed out of the sidebar.** The sidebar's "prefer the fuller snapshot" grouping would hide continuation rows behind a single snapshot even when several of those rows actually have their own messages — making real sessions undiscoverable. Now, when more than one messageful session shares the lineage, the continuations are kept visible; the single-inactive-continuation replacement and the fuller-snapshot preference (when only one row has messages) are unchanged. (#4218)
+
+## [v0.51.428] — 2026-06-15 — Release OO (bound non-git project-context file walk, #4164)
+
+### Fixed
+
+- **The Project Context tab no longer surfaces `AGENTS.md` / `HERMES.md` / `CLAUDE.md` files from ABOVE a non-git workspace.** When a workspace isn't a git repo, the context-file walk had no stop boundary and climbed to the filesystem root, so a file in a parent directory (e.g. `/tmp/HERMES.md` or one in your home dir) could appear in the tab even though it's outside the workspace. The walk is now bounded at the workspace root when there's no git root (the cwd is still scanned, preserving in-workspace context files). A matching bound on the agent-side walk is a tracked follow-up; until then the WebUI may under-report context files that live above a non-git workspace, which is strictly safer than over-reporting them. (#4164)
+
+## [v0.51.427] — 2026-06-15 — Release ON (CLI sessions on by default for new installs #3988 + symlink delete/rename guard #4217)
+
+### Changed
+
+- **CLI / TUI / messaging sessions now appear in the sidebar by default for new installs (#3988).** `show_cli_sessions` now defaults to `True`, so sessions from the CLI, TUI, Telegram, Discord, and the Hermes One desktop app show up in the WebUI sidebar without users having to discover the toggle in Settings. **Existing installs are grandfathered:** a user who already completed onboarding and never opted in keeps their previous (hidden) behavior — the default change only affects fresh installs. The toggle remains in Settings → Sessions for anyone who wants to change it.
+
+### Fixed
+
+- **Deleting or renaming a workspace symlink no longer destroys the file or directory it points to (#4217).** `/api/file/delete` and `/api/file/rename` resolved the final symlink before operating on the target, so a standard delete/rename against a symlink name acted on the real (possibly out-of-workspace) target. Both handlers now reject a symlinked path with a 400, matching the guard the move handler already had. (#4217)
+
+## [v0.51.426] — 2026-06-15 — Release OM (custom-provider model-prefix routing fix, #4210)
+
+### Fixed
+
+- **Custom providers with no `base_url` no longer get hijacked to OpenRouter when the model id has a known-provider prefix.** A bare `custom` or named `custom:<slug>` provider pointed at a vendor-routing proxy (e.g. `custom:llm-proxy` with no configured `base_url`, since the proxy URL is supplied at request time) used to receive an OpenRouter redirect for model ids like `x-ai/grok-2` or `google/gemma-2` whenever the prefix was a member of `_PROVIDER_MODELS`. The backend then failed to initialize with `RuntimeError: No LLM provider configured` because the user had no OpenRouter credentials configured. `resolve_model_provider()` now applies the same custom-provider exemption the `config_base_url` branch already carries (sibling of #3872 / v0.51.349), so the request stays on the user's selected custom provider with the full model id preserved. (#4210)
+
+## [v0.51.425] — 2026-06-15 — Release OL (data-integrity batch: empty-pending guard #4205 + cron-reply fix #3975)
+
+### Fixed
+
+- **A session save can no longer wipe an in-flight conversation to empty.** `Session.save()` now guards against overwriting a session that has on-disk messages with an empty message list while a turn is still in flight (an active stream or a pending user message), preventing a rare data-loss window where a transient empty save clobbered the real transcript. New/legitimately-empty sessions and cancel paths are unaffected. (#4205)
+- **Replying to cron (and other foreign-origin) sessions now works instead of redirecting to the start page.** The chat-send handler now materializes a missing WebUI sidecar from state.db via the shared `_get_or_materialize_session` helper (the same path four sibling handlers already use) and returns a clean 403 on a genuine read-only/messaging-session write, so replies to cron-run sessions send correctly. (#3975)
+
+## [v0.51.424] — 2026-06-15 — Release OK (visible-message tail pagination, #4069)
+
+### Fixed
+
+- **Tool-heavy session tails now paginate by visible messages, so a "page" shows a consistent number of real replies.** Loading a session with many tool-call rows previously let hidden tool rows consume the per-page message budget, so a page could show very few actual user/assistant messages. The paginated window is now sized by visible (user/assistant) rows while still carrying the tool-result rows needed to render each assistant tool card's result snippet, and large hidden tool outputs are bounded in the paginated payload. The paginated tail is a contiguous slice of the same merged transcript the full load produces (no separate raw read path), so it stays display-equivalent. (#4069)
+
+## [v0.51.423] — 2026-06-15 — Release OJ (virtualize long message transcripts, #500)
+
+### Changed
+
+- **Long chat transcripts are now virtualized for smoother scrolling and rendering.** Sessions with more than 80 messages render only a viewport window (plus a buffer and the most recent 50 messages always-rendered) instead of the entire transcript, with spacer elements preserving scroll geometry. Shorter sessions are unchanged. This removes the jank and slow rebuilds that long (hundreds-of-turn) sessions previously hit. Scroll restoration, jump-to-question, live streaming, and session-switch all preserve their behavior. Note: the browser's native in-page find (Ctrl+F) only matches messages currently in the rendered window on very long transcripts. (#500)
+
 ## [v0.51.422] — 2026-06-14 — Release OI (optional Todos tab in workspace panel, #3564)
 
 ### Added
