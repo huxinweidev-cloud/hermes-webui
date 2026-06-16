@@ -14,6 +14,8 @@ PATH DISCOVERY:
     4. System python3 as a last resort
 """
 import json
+import inspect
+import multiprocessing
 import os
 import pathlib
 import shutil
@@ -23,6 +25,24 @@ import time
 import urllib.request
 import urllib.error
 import pytest
+
+if not (3, 11) <= sys.version_info[:2] <= (3, 13):
+    pytest.exit(
+        "Hermes WebUI tests require Python 3.11, 3.12, or 3.13. "
+        "Run ./scripts/test.sh so the repo-local supported .venv is used "
+        "instead of an unsupported system python.",
+        returncode=3,
+    )
+
+WINDOWS = sys.platform == "win32"
+requires_fcntl = pytest.mark.skipif(
+    WINDOWS,
+    reason="requires fcntl-backed nonblocking pipe reads",
+)
+requires_fork = pytest.mark.skipif(
+    "fork" not in multiprocessing.get_all_start_methods(),
+    reason="requires multiprocessing fork",
+)
 
 # ── Repo root discovery ────────────────────────────────────────────────────
 # conftest.py lives at <repo>/tests/conftest.py
@@ -52,10 +72,52 @@ def _auto_state_dir_name(repo_root) -> str:
 TEST_PORT      = int(os.getenv('HERMES_WEBUI_TEST_PORT',
                                str(_auto_test_port(REPO_ROOT))))
 TEST_BASE      = f"http://127.0.0.1:{TEST_PORT}"
+
+# ── Test state dir: HARD-ISOLATED from production ──────────────────────────
+# Test state must NEVER live inside the real Hermes home (~/.hermes or any
+# HERMES_HOME), or anywhere near production profiles/files/server. Earlier this
+# defaulted to ``HERMES_HOME / webui-test-<hash>`` which wrote test state INTO
+# ~/.hermes/profiles/<...>/ (observed: 144 leaked webui-test-* dirs in the real
+# profile home). We now anchor the default under the OS temp dir, in a dedicated
+# `hermes-webui-tests/` namespace, fully outside any production tree.
+import tempfile as _tempfile
+_TEST_STATE_ROOT = pathlib.Path(
+    os.getenv('HERMES_WEBUI_TEST_STATE_ROOT', _tempfile.gettempdir())
+) / 'hermes-webui-tests'
 TEST_STATE_DIR = pathlib.Path(os.getenv(
     'HERMES_WEBUI_TEST_STATE_DIR',
-    str(HERMES_HOME / _auto_state_dir_name(REPO_ROOT))
-))
+    str(_TEST_STATE_ROOT / _auto_state_dir_name(REPO_ROOT))
+)).resolve()
+
+# Production-proximity guard: refuse to run if the resolved test state dir lands
+# inside the REAL Hermes home tree — a misconfigured HERMES_WEBUI_TEST_STATE_DIR
+# pointing at ~/.hermes would let tests wipe/clobber production profiles,
+# sessions, and credentials on teardown. We anchor on the literal user-home
+# `~/.hermes` (NOT $HERMES_HOME): HERMES_HOME is frequently overridden to a
+# profile dir or, during a test run, to TEST_STATE_DIR itself — comparing
+# against it would either miss a real production path or false-trip when the
+# test dir legitimately lives in /tmp. A test dir under the OS temp dir is always
+# allowed even if it nominally sits below a temp-rooted HERMES_HOME.
+_PROD_HERMES_HOME = (HOME / '.hermes').resolve()
+_TEMP_ROOT = pathlib.Path(_tempfile.gettempdir()).resolve()
+# The temp-root exception only holds when the temp root is itself OUTSIDE the
+# production home. If TMPDIR is (mis)configured under ~/.hermes, a "temp" path is
+# still a production path — don't let it suppress the guard.
+_temp_root_is_safe = not (
+    _TEMP_ROOT == _PROD_HERMES_HOME or _PROD_HERMES_HOME in _TEMP_ROOT.parents
+)
+_under_temp = _temp_root_is_safe and (
+    TEST_STATE_DIR == _TEMP_ROOT or _TEMP_ROOT in TEST_STATE_DIR.parents
+)
+_under_prod = TEST_STATE_DIR == _PROD_HERMES_HOME or _PROD_HERMES_HOME in TEST_STATE_DIR.parents
+if _under_prod and not _under_temp:
+    raise RuntimeError(
+        f"REFUSING TO RUN: test state dir {TEST_STATE_DIR} is inside the production "
+        f"Hermes home {_PROD_HERMES_HOME}. Tests must never touch production files. "
+        f"Unset HERMES_WEBUI_TEST_STATE_DIR (defaults to a temp dir) or point it "
+        f"outside ~/.hermes."
+    )
+
 TEST_WORKSPACE = TEST_STATE_DIR / 'test-workspace'
 
 # Publish at module level so api.config, _pytest_port.py, and any test module
@@ -236,6 +298,8 @@ requires_agent_modules = pytest.mark.skipif(
 def pytest_configure(config):
     config.addinivalue_line("markers", "requires_agent: skip when hermes-agent dir is not found")
     config.addinivalue_line("markers", "requires_agent_modules: skip when hermes-agent Python modules are not importable")
+    config.addinivalue_line("markers", "requires_fcntl: skip when fcntl-backed file-descriptor operations are unavailable")
+    config.addinivalue_line("markers", "requires_fork: skip when the platform lacks multiprocessing fork support")
 
 
 @pytest.hookimpl(hookwrapper=True, tryfirst=True)
@@ -593,6 +657,142 @@ def _server_boot_diagnostic(headline, log_path):
     return "\n".join(parts)
 
 
+def _kill_process_tree(pid):
+    """Best-effort kill for a known fixture-owned or port-owning PID."""
+    if not pid or pid <= 0:
+        return
+    try:
+        if sys.platform == "win32":
+            subprocess.run(
+                ["taskkill", "/PID", str(pid), "/T", "/F"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=5,
+                **({"creationflags": subprocess.CREATE_NO_WINDOW}),
+            )
+            return
+        import signal
+
+        os.kill(pid, signal.SIGKILL)
+    except Exception:
+        pass
+
+
+def _kill_port_owner(port):
+    """Best-effort free of TEST_PORT, using a Windows-native owner lookup."""
+    try:
+        if sys.platform != "win32":
+            subprocess.run(["fuser", "-k", f"{port}/tcp"], capture_output=True, timeout=5)
+            return
+
+        creationflags = {"creationflags": subprocess.CREATE_NO_WINDOW}
+        ps_cmd = (
+            "$port = " + str(port) + "; "
+            "$conn = Get-NetTCPConnection -LocalPort $port -ErrorAction SilentlyContinue | "
+            "Where-Object { $_.LocalAddress -in @('127.0.0.1', '::1', '0.0.0.0', '::', '::ffff:127.0.0.1') } | "
+            "Select-Object -First 1 -ExpandProperty OwningProcess; "
+            "if ($conn) { $conn }"
+        )
+        proc = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_cmd],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            **creationflags,
+        )
+        pid_text = proc.stdout.strip()
+        if not pid_text:
+            proc = subprocess.run(
+                ["netstat", "-ano", "-p", "tcp"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                **creationflags,
+            )
+            port_suffixes = (f":{port}", f"[::]:{port}", f"127.0.0.1:{port}", f"[::1]:{port}")
+            for line in proc.stdout.splitlines():
+                parts = line.split()
+                if len(parts) < 5 or parts[0].upper() != "TCP":
+                    continue
+                local_addr = parts[1]
+                state = parts[3].upper()
+                owner_pid = parts[4]
+                if state == "LISTENING" and any(local_addr.endswith(suffix) for suffix in port_suffixes):
+                    pid_text = owner_pid
+                    break
+        if pid_text:
+            _kill_process_tree(int(pid_text))
+    except Exception:
+        pass
+
+
+def _rmtree_retry(path):
+    """Remove a tree, retrying transient races (Linux + Windows).
+
+    The retry loop covers two real failure modes seen in CI/local:
+      * Windows: read-only bits / lingering handles (cleared via onexc/onerror).
+      * Linux: `OSError [Errno 39] Directory not empty` — a background thread or
+        daemon (model-metadata fetcher, session-events watcher, profile writer)
+        creates a file inside the tree WHILE shutil.rmtree is walking it, so the
+        parent rmdir fails even though we just emptied it. A short retry lets the
+        racing writer settle; a final ignore_errors sweep guarantees teardown
+        never fails the test over a pure cleanup race (the dir is abandoned test
+        state, not an assertion target).
+    """
+    target = pathlib.Path(path)
+    if not target.exists():
+        return
+
+    def _clear_readonly(_func, entry, _exc):
+        try:
+            os.chmod(entry, 0o666)
+            _func(entry)
+        except Exception:
+            raise
+
+    rmtree_kwargs = (
+        {"onexc": _clear_readonly}
+        if "onexc" in inspect.signature(shutil.rmtree).parameters
+        else {"onerror": _clear_readonly}
+    ) if sys.platform == "win32" else {}
+
+    attempts = 5
+    last_exc = None
+    for attempt in range(1, attempts + 1):
+        try:
+            shutil.rmtree(target, **rmtree_kwargs)
+            return
+        except FileNotFoundError:
+            return
+        except Exception as exc:
+            last_exc = exc
+            if attempt == attempts:
+                break
+            time.sleep(0.3)
+
+    # Final fallback: a concurrent-writer race (Errno 39) shouldn't fail teardown.
+    # Best-effort ignore_errors sweep; if anything remains it's abandoned test
+    # state under HERMES_HOME, not something a test asserts on.
+    shutil.rmtree(target, ignore_errors=True)
+    if not target.exists():
+        return
+    leftovers = []
+    try:
+        leftovers = [child.name for child in list(target.iterdir())[:5]]
+    except Exception:
+        pass
+    # Don't raise — log-and-continue. Raising here turns a benign cleanup race
+    # into a spurious test ERROR (the behaviour #4283-area tests hit when a
+    # model-metadata background fetch repopulated the profile dir mid-teardown).
+    import warnings as _warnings
+    leftover_note = f" leftovers={leftovers}" if leftovers else ""
+    _warnings.warn(
+        f"_rmtree_retry: could not fully remove {target} after {attempts} attempts"
+        f"{leftover_note} (last_exc={last_exc!r}); left for OS temp cleanup.",
+        stacklevel=2,
+    )
+
+
 # ── Session-scoped test server ────────────────────────────────────────────────
 
 @pytest.fixture(scope="session", autouse=True)
@@ -604,18 +804,13 @@ def test_server():
     # Kill any leftover process on the test port before starting.
     # Stale servers from QA harness runs or prior test sessions cause
     # conftest to think the server is already up, producing false failures.
-    try:
-        import subprocess as _sp
-        _sp.run(['fuser', '-k', f'{TEST_PORT}/tcp'],
-                capture_output=True, timeout=5)
-    except Exception:
-        pass
+    _kill_port_owner(TEST_PORT)
     import time as _time
     _time.sleep(0.5)  # brief pause to let the port release
 
     # Clean slate
     if TEST_STATE_DIR.exists():
-        shutil.rmtree(TEST_STATE_DIR)
+        _rmtree_retry(TEST_STATE_DIR)
     TEST_STATE_DIR.mkdir(parents=True)
     TEST_WORKSPACE.mkdir(parents=True)
 
@@ -751,16 +946,12 @@ def test_server():
         last_reason = reason
         # Tear down the failed attempt and free the port before retrying.
         try:
-            proc.kill()
+            _kill_process_tree(proc.pid)
             proc.wait(timeout=5)
         except Exception:
             pass
         if _attempt < boot_attempts:
-            try:
-                import subprocess as _sp2
-                _sp2.run(['fuser', '-k', f'{TEST_PORT}/tcp'], capture_output=True, timeout=5)
-            except Exception:
-                pass
+            _kill_port_owner(TEST_PORT)
             time.sleep(1.0)
     else:
         pytest.fail(
@@ -779,12 +970,9 @@ def test_server():
     try:
         proc.wait(timeout=5)
     except subprocess.TimeoutExpired:
-        proc.kill()
+        _kill_process_tree(proc.pid)
 
-    try:
-        shutil.rmtree(TEST_STATE_DIR)
-    except Exception:
-        pass
+    _rmtree_retry(TEST_STATE_DIR)
 
 
 # ── Test base URL ─────────────────────────────────────────────────────────────
