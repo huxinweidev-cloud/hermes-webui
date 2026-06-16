@@ -7,6 +7,42 @@
 
 - **Windows pytest-harness compatibility (#3664).** Hardened the test suite to run on Windows: profile-home fallback paths are path-normalized, strict POSIX file-mode (`0o600`) assertions are gated behind `os.name != "nt"` (Linux still asserts them at full strictness), the conftest cleanup handles Windows process-tree/port teardown and the Py3.12+ `shutil.rmtree` `onexc` shim, and tests that require `fork`/`fcntl` carry `@requires_fork` / `@requires_fcntl` markers (which never skip on Linux). Test-only — no runtime or app behavior change, no Linux CI behavior change. (#4254, #4255, #4256, #4257, #4259, #4263, #4266, #4274)
 
+## [v0.51.454] — 2026-06-16 — Release PO (complete the Japanese UI translation)
+
+### Changed
+
+- **Japanese (`ja`) locale: translated the remaining English fallbacks.** 69 UI strings in the Japanese locale that were still falling back to English — covering the activity-display modes, advanced/auxiliary model options, the gateway-approval message, and assorted settings labels — now have natural Japanese translations, bringing the `ja` block to parity with English. Proper nouns and fixed abbreviations (URL, N/A, YOLO, JSON, Hermes Agent, placeholders) are intentionally left as-is. No key changes — values only. (#4301)
+
+## [v0.51.453] — 2026-06-16 — Release PN (approval controls work on remote-gateway backends)
+
+### Fixed
+
+- **Tool-approval prompts on a remote-gateway backend now show working approve/deny controls.** When the WebUI was connected to a Hermes gateway that ran the agent, an approval request would appear but its approve/deny action had no backend to respond to, so the buttons did nothing. The WebUI now bridges the approval response to the gateway's runs API: when a session has an active gateway run, the approve/deny choice is forwarded to the gateway (run id is server-derived; the existing auth + CSRF on `/api/approval/respond` is preserved), and the gateway's approval-event capability is probed (and cached for 60s) so the runs-API path is used only when the gateway advertises support. Backends that don't use a gateway are unaffected — the local approval path is unchanged and only runs when no gateway run is active. Gateways too old to advertise approval support surface a clear "upgrade the gateway" message instead of a silent no-op. (#4229, #4203)
+
+## [v0.51.452] — 2026-06-16 — Release PM (reject symlinked memory-file writes)
+
+### Security
+
+- **Memory writes refuse a symlinked target file.** Writing memory (`MEMORY.md` / `USER.md` / `SOUL.md`) now rejects the write if the target path is a symlink, so a symlink planted at the memory path — e.g. via a restored or imported workspace — can no longer redirect a memory write to clobber an arbitrary file outside the memories directory. This extends the symlink-rejection hardening already shipped for skills and plugins (#4217 / #4234 / #4240). A symlinked parent `memories/` directory is intentionally still allowed (symlinking the whole directory is a legitimate setup); only the concrete target file is guarded. (#4242)
+
+## [v0.51.451] — 2026-06-16 — Release PL (show named-profile external sessions in the all-profiles list)
+
+### Fixed
+
+- **The "all profiles" session list now includes CLI / Telegram / API sessions that live under named profiles.** Previously the all-profiles view enumerated only the active profile's external (non-WebUI) sessions, so a session started by a named-profile CLI, Telegram, or API client never appeared even with "all profiles" selected. Enumeration now scans across profiles when (and only when) the request explicitly asks for the all-profiles view. The cross-profile boundary is preserved: an unqualified single-profile request still resolves to the active profile's `state.db` (a foreign session id returns 404, the same not-found shape as a missing session), and the client only sends the cross-profile import fields from the all-profiles view — mirroring the active-profile scoping already applied to session detail loads and exports. (#4067, #4065)
+
+## [v0.51.450] — 2026-06-16 — Release PK (preserve custom provider namespace prefixes in model normalization)
+
+### Fixed
+
+- **Custom provider model namespaces are no longer silently rewritten to a first-party family.** `_normalize_provider_id` matched provider prefixes with a broad `startswith()`, so a custom namespace that merely *began* with a first-party token — `gemini_cli/...`, `gpt_proxy/...`, `claude-relay/...` — collapsed into the first-party family (`google`/`openai`/`anthropic`). On session reload this triggered a spurious "stale model repair" that swapped the model to the profile default and cleared the displayed turn metrics (`last_prompt_tokens`, `threshold_tokens`), making the composer context indicator ring disappear for custom models. Prefix matching is now restricted to an exact token or a prefix followed strictly by an accepted namespace delimiter (`:` or `/`), and genuine hyphenated first-party aliases (`openai-api`, `openai-codex`, `google-gemini`, `google-ai-studio`, `claude-code`) are mapped explicitly so they still resolve. The same bare-prefix collision was also fixed on the chat-send path (the streaming profile-context resolver had its own ungated loop), and the bare-prefix family detection no longer fires on namespaced model IDs. (#4278)
+
+## [v0.51.449] — 2026-06-16 — Release PJ (stop recovered turns replaying into later context)
+
+### Fixed
+
+- **Interrupted conversations no longer replay the prior message into every later turn.** After a session was interrupted (gateway restart or tool-iteration limit) and recovered, the WebUI could re-inject the recovered user message into the context of each subsequent turn. The state-database context reconciliation now recognizes a recovered turn as a valid single-row aligned prefix (gated strictly to a recovered user turn at the head of the window), so it's matched and de-duplicated instead of replayed. (#4283)
+
 ## [v0.51.448] — 2026-06-16 — Release PI (fix blank transcript viewport regression)
 
 ### Fixed

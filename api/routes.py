@@ -1282,6 +1282,10 @@ _PROVIDER_ALIASES = {
     "gpt": "openai",
     "gemini": "google",
     "openai-codex": "openai",
+    "openai-api": "openai",
+    "google-gemini": "google",
+    "google-ai-studio": "google",
+    "claude-code": "anthropic",
 }
 
 # OpenAI-compatible /v1/models endpoints for live model discovery.
@@ -1588,7 +1592,7 @@ def _build_session_list_cache_payload(
     webui_sessions = [_normalize_sidebar_source_flags(s) for s in webui_sessions]
     if show_cli_sessions:
         diag_stage("get_cli_sessions")
-        cli = get_cli_sessions(source_filter=source_filter)
+        cli = get_cli_sessions(source_filter=source_filter, all_profiles=all_profiles)
         diag_stage("merge_cli_sessions")
         cli_by_id = {s["session_id"]: s for s in cli}
         # #3238: reconcile orphaned imported-CLI sidecars. When a CLI
@@ -2908,6 +2912,13 @@ def _handle_client_event_log(handler, body: dict) -> bool:
     return j(handler, {"ok": True, "event": payload.get("event")}) or True
 
 
+def _starts_token(raw: str, prefix: str) -> bool:
+    if not raw.startswith(prefix):
+        return False
+    rest = raw[len(prefix):]
+    return rest == "" or rest[0] in ":/"
+
+
 def _normalize_provider_id(value: str | None) -> str:
     raw = str(value or "").strip().lower()
     if not raw:
@@ -2924,7 +2935,7 @@ def _normalize_provider_id(value: str | None) -> str:
         ("openrouter", "openrouter"),
         ("custom", "custom"),
     ):
-        if raw.startswith(prefix):
+        if _starts_token(raw, prefix):
             return normalized
     # Unknown prefix — return empty so callers treat it as "no match" and pass
     # the model through unchanged rather than incorrectly stripping it.
@@ -3479,11 +3490,12 @@ def _resolve_compatible_session_model_state(
         model_provider_from_name = _normalize_provider_id(model_prefix) if "/" in model else ""
 
         model_family = ""
-        model_lower = model.lower()
-        for bare_prefix in ("gpt", "claude", "gemini"):
-            if model_lower.startswith(bare_prefix):
-                model_family = _normalize_provider_id(bare_prefix)
-                break
+        if "/" not in model:
+            model_lower = model.lower()
+            for bare_prefix in ("gpt", "claude", "gemini"):
+                if model_lower.startswith(bare_prefix):
+                    model_family = _normalize_provider_id(bare_prefix)
+                    break
 
         if model_family and model_family != _profile_provider_normalized:
             if explicit_model_pick:
@@ -3874,16 +3886,50 @@ def _lookup_gateway_session_identity(session_id: str) -> dict:
     return metadata if isinstance(metadata, dict) else {}
 
 
-def _lookup_cli_session_metadata(session_id: str) -> dict:
+def _lookup_cli_session_metadata(session_id: str, *, all_profiles: bool = False) -> dict:
     if not session_id:
         return {}
     try:
-        for row in get_cli_sessions():
+        for row in get_cli_sessions(all_profiles=all_profiles):
             if row.get("session_id") == session_id:
                 return row
     except Exception:
         return {}
     return {}
+
+
+def _request_wants_all_profiles_import(body) -> bool:
+    if not isinstance(body, dict):
+        return False
+    value = body.get("all_profiles")
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
+def _normalize_import_profile_value(value):
+    profile = str(value or "").strip()
+    if not profile:
+        return None
+    try:
+        from api.profiles import _PROFILE_ID_RE
+        if profile != "default" and not _PROFILE_ID_RE.fullmatch(profile):
+            return ""
+    except Exception:
+        pass
+    return profile
+
+
+def _resolve_cli_import_metadata(session_id: str, *, requested_profile=None, allow_all_profiles: bool = False) -> dict:
+    cli_meta = _lookup_cli_session_metadata(session_id)
+    if cli_meta and (not requested_profile or _profiles_match(cli_meta.get("profile"), requested_profile)):
+        return cli_meta
+    if not allow_all_profiles:
+        return {}
+    cli_meta = _lookup_cli_session_metadata(session_id, all_profiles=True)
+    if cli_meta and requested_profile and not _profiles_match(cli_meta.get("profile"), requested_profile):
+        return {}
+    return cli_meta or {}
 
 
 def _messaging_session_identity(session: dict, raw_source: str) -> str:
@@ -15552,6 +15598,31 @@ def _handle_approval_respond(handler, body):
         return bad(handler, f"Invalid choice: {choice}")
     approval_id = body.get("approval_id", "")
 
+    # Gateway relay: forward choice to the runs API when session has an active run.
+    try:
+        from api.gateway_chat import _STREAM_RUN_IDS, _gateway_base_url, _gateway_api_key
+        from api.config import get_config as _get_config
+        s = get_session(sid)
+        _run_id = None
+        if s is not None:
+            active_sid = getattr(s, "active_stream_id", None)
+            if active_sid:
+                _run_id = _STREAM_RUN_IDS.get(active_sid)
+        if _run_id:
+            if not approval_id:
+                return bad(handler, "approval_id is required for gateway approvals")
+            from api.runner_client import HttpRunnerClient, RunnerClientError
+            _cfg = _get_config()
+            _base = _gateway_base_url(_cfg)
+            _key = _gateway_api_key()
+            try:
+                HttpRunnerClient(base_url=_base, api_key=_key).respond_approval(_run_id, approval_id, choice)
+            except (RunnerClientError, ValueError) as exc:
+                return j(handler, {"ok": False, "choice": choice, "relayed": True, "error": str(exc)}, status=502)
+            return j(handler, {"ok": True, "choice": choice, "relayed": True})
+    except Exception:
+        pass  # fall through to local approval path
+
     from api.runtime_adapter import LegacyJournalRuntimeAdapter, runtime_adapter_enabled
 
     if runtime_adapter_enabled():
@@ -16896,6 +16967,13 @@ def _handle_memory_write(handler, body):
         target = home / "SOUL.md"
     else:
         return bad(handler, 'section must be "memory", "user", or "soul"')
+    # Refuse to write through a symlinked target file: a symlink planted at the
+    # memory path (e.g. via a restored/imported workspace) would otherwise let a
+    # memory write clobber an arbitrary file outside the memories directory. This
+    # mirrors the symlink-rejection hardening already shipped for skills/plugins
+    # (#4217/#4234/#4240).
+    if target.is_symlink():
+        return bad(handler, "Cannot write to a symlinked memory file")
     target.write_text(body["content"], encoding="utf-8")
     return j(handler, {"ok": True, "section": section, "path": str(target)})
 
@@ -16985,17 +17063,39 @@ def _handle_session_import_cli(handler, body):
         return bad(handler, str(e))
 
     sid = str(body["session_id"])
+    requested_profile = _normalize_import_profile_value((body or {}).get("profile"))
+    if requested_profile == "":
+        return bad(handler, "invalid profile", 400)
+    allow_all_profiles = _request_wants_all_profiles_import(body)
+    if allow_all_profiles and not requested_profile:
+        return bad(handler, "profile is required for all_profiles import", 400)
 
     # Check if already imported — refresh messages from CLI store if new ones arrived
     existing = Session.load(sid)
     if existing:
-        fresh_msgs = get_cli_session_messages(sid)
+        # Cross-profile boundary: an unqualified (non-all-profiles) request must not
+        # read or refresh a session that belongs to another profile, even though the
+        # WebUI session store (SESSION_DIR) is a single global directory. This mirrors
+        # the /api/session detail and /api/session/export profile-scoping gates.
+        # An explicit all_profiles import is still allowed, but only when the request's
+        # profile matches the stored session's profile.
+        existing_profile = getattr(existing, "profile", None)
+        if allow_all_profiles:
+            if requested_profile and not _profiles_match(existing_profile, requested_profile):
+                return bad(handler, "Session not found in CLI store", 404)
+        elif not _session_visible_to_active_profile(existing_profile, handler):
+            return bad(handler, "Session not found in CLI store", 404)
+        refresh_profile = requested_profile or existing_profile
+        cli_meta = _resolve_cli_import_metadata(
+            sid,
+            requested_profile=refresh_profile,
+            allow_all_profiles=allow_all_profiles,
+        )
+        fresh_msgs = get_cli_session_messages(
+            sid,
+            profile=(cli_meta or {}).get("profile") or refresh_profile,
+        )
         changed = False
-        cli_meta = None
-        for cs in list(get_cli_sessions()):
-            if cs["session_id"] == sid:
-                cli_meta = cs
-                break
         if fresh_msgs and len(fresh_msgs) > len(existing.messages):
             # Prefix-equality guard: only extend if existing messages are a prefix of
             # the fresh CLI messages. Prevents silently dropping WebUI-added messages
@@ -17041,48 +17141,33 @@ def _handle_session_import_cli(handler, body):
         )
 
     # Fetch messages from CLI store
-    msgs = get_cli_session_messages(sid)
+    cli_meta = _resolve_cli_import_metadata(
+        sid,
+        requested_profile=requested_profile,
+        allow_all_profiles=allow_all_profiles,
+    )
+    profile = cli_meta.get("profile") if cli_meta else (requested_profile if allow_all_profiles else None)
+    msgs = get_cli_session_messages(sid, profile=profile)
     if not msgs:
         return bad(handler, "Session not found in CLI store", 404)
 
     # Get profile, model, timestamps, and title from CLI session metadata
-    profile = None
-    created_at = None
-    updated_at = None
-    cli_title = None
-    cli_source_tag = None
-    model = "unknown"
-    cli_raw_source = None
-    cli_session_source = None
-    cli_source_label = None
-    cli_user_id = None
-    cli_chat_id = None
-    cli_chat_type = None
-    cli_thread_id = None
-    cli_session_key = None
-    cli_platform = None
-    cli_parent_session_id = None
-    cli_read_only = False
-    for cs in get_cli_sessions():
-        if cs["session_id"] == sid:
-            profile = cs.get("profile")
-            model = cs.get("model", "unknown")
-            created_at = cs.get("created_at")
-            updated_at = cs.get("updated_at")
-            cli_title = cs.get("title")
-            cli_source_tag = cs.get("source_tag")
-            cli_raw_source = cs.get("raw_source")
-            cli_session_source = cs.get("session_source")
-            cli_source_label = cs.get("source_label")
-            cli_user_id = cs.get("user_id")
-            cli_chat_id = cs.get("chat_id")
-            cli_chat_type = cs.get("chat_type")
-            cli_thread_id = cs.get("thread_id")
-            cli_session_key = cs.get("session_key")
-            cli_platform = cs.get("platform")
-            cli_parent_session_id = cs.get("parent_session_id")
-            cli_read_only = bool(cs.get("read_only"))
-            break
+    created_at = cli_meta.get("created_at") if cli_meta else None
+    updated_at = cli_meta.get("updated_at") if cli_meta else None
+    cli_title = cli_meta.get("title") if cli_meta else None
+    cli_source_tag = cli_meta.get("source_tag") if cli_meta else None
+    model = cli_meta.get("model", "unknown") if cli_meta else "unknown"
+    cli_raw_source = cli_meta.get("raw_source") if cli_meta else None
+    cli_session_source = cli_meta.get("session_source") if cli_meta else None
+    cli_source_label = cli_meta.get("source_label") if cli_meta else None
+    cli_user_id = cli_meta.get("user_id") if cli_meta else None
+    cli_chat_id = cli_meta.get("chat_id") if cli_meta else None
+    cli_chat_type = cli_meta.get("chat_type") if cli_meta else None
+    cli_thread_id = cli_meta.get("thread_id") if cli_meta else None
+    cli_session_key = cli_meta.get("session_key") if cli_meta else None
+    cli_platform = cli_meta.get("platform") if cli_meta else None
+    cli_parent_session_id = cli_meta.get("parent_session_id") if cli_meta else None
+    cli_read_only = bool((cli_meta or {}).get("read_only"))
 
     # Use the CLI session title if available (e.g., cron job name), otherwise derive from messages
     title = cli_title or title_from(msgs, "CLI Session")
