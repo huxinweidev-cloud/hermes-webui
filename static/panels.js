@@ -6773,7 +6773,7 @@ async function loadSettingsPanel(){
         window._virtualizeTranscript=virtualizeTranscriptCb.checked;
         // Re-render the open transcript so the change takes effect immediately
         // (full render when off, windowed when on).
-        if(typeof renderMessages==='function'){ try{ renderMessages({preserveScroll:true}); }catch(_){ } }
+        if(typeof renderMessages==='function'){ try{ renderMessages({preserveScroll:true}); }catch(e){ console.warn('[virtualize_transcript] renderMessages failed on toggle:',e); } }
         _schedulePreferencesAutosave();
       },{once:false});
     }
