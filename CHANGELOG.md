@@ -3,9 +3,143 @@
 
 ## [Unreleased]
 
+## [v0.51.475] — 2026-06-17 — Release QJ (ElevenLabs TTS engine)
+
+### Added
+
+- **ElevenLabs is now selectable as a TTS engine in the WebUI (#3510).** Alongside Browser speech synthesis and Edge TTS, you can pick ElevenLabs for voice mode and message read-aloud. It uses the same credentials and voice you've already configured for the Hermes agent — `ELEVENLABS_API_KEY` (env, falling back to `~/.hermes/.env`) and `tts.elevenlabs.voice_id` / `model` from `config.yaml` — so there's nothing new to set up if the agent already has it (ElevenLabs is a built-in Hermes TTS provider). The endpoint validates the configured `voice_id` as a safe path segment, enforces the existing 5000-character cap and rate limit, and returns a clear error when no key is configured. Thanks @linux-fertxo.
+
+## [v0.51.474] — 2026-06-17 — Release QI (reconcile WebUI session source flags)
+
+### Fixed
+
+- **A WebUI-native session is no longer force-reloaded as if it were an imported CLI transcript (#4348).** When a WebUI-origin session carried a stale sidecar that still said `raw_source=cli` / `is_cli_session=true` (while state.db correctly recorded it as WebUI-origin), `/api/session` returned the stale flags and the browser opened it as an external session — entering the periodic external-refresh reload path that could rebuild the transcript while you were reading it. The detail endpoint now reconciles its source flags against the state.db row (the source of truth) before redaction, and the frontend `_isExternalSession()` refuses to classify an explicit WebUI-source session as external. Keeps the list and detail endpoints on one source-classification contract; imported CLI/messaging sessions are unaffected. Thanks @dso2ng.
+
+## [v0.51.473] — 2026-06-17 — Release QH (clean cancelled user context chains)
+
+### Fixed
+
+- **A cancelled or interrupted correction turn no longer reappears as a stale prefix on later messages (#4341).** WebUI keeps a visible transcript and a model-facing `context_messages` layer; when a correction turn was cancelled/interrupted, the agent's role-alternation repair could merge the stale user text into a later clean turn as `<stale>\n\n<current>`, contaminating model-facing context (and sometimes the visible transcript). Building on the one-hop cleanup in #4089, the WebUI merge/writeback boundary now also recognizes multi-hop repaired chains and replayed stale prefixes from older polluted rows, normalizing only the current-turn row back to exactly what the user submitted. The fix is anchored on a strict invariant — the repair suffix must normalize to the *entire* submitted turn — so multi-paragraph prompts, shared-prefix messages, and repeated identical turns are never mistaken for stale chains, and already-committed historical context rows are left intact. Thanks @starship-s.
+
+## [v0.51.472] — 2026-06-17 — Release QG (paste image + text together)
+
+### Fixed
+
+- **Pasting an image copied from a browser, Notes, or Slack now attaches the image again (#1620 regression).** When the clipboard carries both text and an image (the normal shape for "right-click → Copy Image" and most rich-source copies), the composer paste handler previously bailed entirely and silently dropped the image. It now attaches any real image (`kind==='file'` image item) while still letting the browser paste accompanying text normally — matching how the major AI chat UIs handle paste. Pure screenshots still attach as before, plain text still pastes with no attachment, and a rich-text editor's rendered HTML preview (a `text/html` string, not a file) is not misclassified as an image. Thanks @kaishi00.
+
+## [v0.51.471] — 2026-06-17 — Release QF (searchable settings)
+
+### Added
+
+- **Settings is now searchable (#3850).** A search box at the top of the Settings panel lets you find any setting across all sections (Appearance, Preferences, Providers, Plugins, System) without clicking through tabs — type a label fragment (e.g. "model", "theme", "language") and matching fields appear in a dropdown with their section breadcrumb. Clicking a result jumps to that section, scrolls the field into view, and pulses a brief highlight on it. Search clears after a pick. The index is built once on first search (covering lazily-loaded provider/plugin cards) and memoized. Thanks @rodboev.
+
+## [v0.51.470] — 2026-06-17 — Release QE (transcript virtualization now experimental / off by default)
+
+### Changed
+
+- **Transcript virtualization is now experimental and off by default (#4343).** The windowed rendering of very long transcripts (#500/#4214) caused a scroll-up flicker on long sessions with large tool-call blocks — the viewport "flicks back and forth" while scrolling up (a variable-height virtual-scroll anchor oscillation, distinct from the stream-completion jump fixed in #4325). Until the scroll behavior can be made reliable, the "Virtualize long transcripts" preference now defaults **off** for everyone — including anyone who had it on during v0.51.469 — and is relabeled experimental/opt-in. By default the full transcript renders at once (no flicker, and the browser's Find/Ctrl+F matches the whole conversation). You can opt back in under Settings → Preferences. Thanks @b3nw for the report and A/B confirmation. (Root-cause scroll-stability work tracked separately.)
+
+## [v0.51.469] — 2026-06-17 — Release QD (transcript virtualization fix + opt-out)
+
+### Fixed
+
+- **Long chat transcripts no longer freeze, jump to an older message, and scroll back after a streaming response completes (#4325).** Since transcript virtualization shipped (v0.51.440, #500/#4214), finalizing a streamed reply on a long (80+ message) session re-measured virtual row heights and restored the viewport by a stale pixel `scrollTop` that pointed at the wrong message after the remeasure — producing a freeze + scroll-jump + snap-back. The stream-end scroll restore now re-pins to a semantic DOM row (by message index) instead of a raw pixel offset, and when that anchor row was virtualized out of the current window it is mounted (scroll nudged + re-render with `preserveScroll`) before restoring. Thanks @rodboev (#4328).
+
+### Added
+
+- **You can now turn off transcript virtualization (#4325).** A new Preferences setting, "Virtualize long transcripts" (on by default), lets you opt out of the windowed rendering for very long transcripts. When disabled, the full transcript renders at once — useful if you hit any virtualization rendering/scroll edge case or want the browser's native Find (Ctrl+F) to match the entire conversation. Disabling it also short-circuits the virtual re-measure loop entirely.
+
+## [v0.51.468] — 2026-06-17 — Release QC (onboarding OAuth single-flight)
+
+### Security
+
+- **Onboarding OAuth start is now single-flight per provider/profile (#3972).** `POST /api/onboarding/oauth/start` runs background provider polling so the UI can detect completed CLI OAuth setup, and is reachable unauthenticated while first-run auth is being configured. Repeated start requests for the same provider/profile previously accumulated unbounded in-memory pending flows and daemon polling workers. The start path is now serialized under a per-`(provider, hermes_home)` lock across the full check → device-code request → flow insertion → worker spawn sequence, and the in-memory check-and-insert is paired atomically under the flows lock — so concurrent duplicate starts reuse the existing pending flow instead of racing a second device-code request or spawning a duplicate worker. Single (non-duplicate) start behavior is unchanged. Thanks @Hinotoi-agent.
+
+## [v0.51.467] — 2026-06-16 — Release QB (symlinks in workspace file tree)
+
+### Added
+
+- **The workspace file tree now shows symlinks with a distinct chain-link icon (#4226).** Symbolic links (both directory and file symlinks) render with a chain-link icon instead of the regular file/folder icon, and hovering a symlink shows "Symlink → {target}" with long targets middle-elided. Directory symlinks still expand and navigate like folders; regular files and folders are unchanged. The symlink target is the server-resolved path (already filtered to in-workspace targets by the existing workspace trust boundary) and is rendered via the DOM `title` property — never an HTML sink — so an arbitrary symlink target cannot inject markup. Thanks @rodboev.
+
+## [v0.51.466] — 2026-06-16 — Release QA (active transcript reconciles on session events)
+
+### Fixed
+
+- **An open WebUI transcript now reconciles when another client/process updates it (#4205 follow-up).** The #3916/#4195 external-refresh guard made the 30-second poll correctly skip WebUI-native sessions — but it also made `refreshActiveSessionIfExternallyUpdated()` return early for *every* non-external session, so a real `sessions_changed` event would update the sidebar list while leaving the currently-open transcript stale. The early-return is now scoped to the periodic `poll` path only; `event`/focus/visibility triggers run the existing count/timestamp divergence check (guarded by the in-flight/busy/streaming locks, so no refresh loop), and `_scheduleSessionEventsRefresh` reconciles the active transcript, not just the sidebar.
+
+## [v0.51.465] — 2026-06-16 — Release PZ (workspace null-byte hardening)
+
+### Fixed
+
+- **Remote workspace paths containing an embedded null byte are now rejected (#4326).** Completes the #4273/#3664 remote-workspace trust-boundary hardening (v0.51.463): `_remote_terminal_workspace_candidate` now fails closed on a `\x00` in either the candidate path or `terminal.cwd`, before normalization. Previously a null-byte path skipped the POSIX-normalize branch, `_safe_resolve` swallowed the `ValueError` and returned the raw null `Path`, and the string-level containment check wrongly succeeded — accepting the path. Matches the fail-closed null-byte handling already applied at `_as_posix_path` / `_safe_resolve`. Thanks @rodboev.
+
+## [v0.51.464] — 2026-06-16 — Release PY (scannable model picker)
+
+### Added
+
+- **Model picker provider groups are now collapsible and open scannable (#4279).** Provider groups in the model picker start collapsed except the group that owns your currently-selected model, so a picker with many providers/models opens as a tidy list of provider headings rather than one long flat scroll. Searching auto-expands matching groups (and searches hidden overflow models); clearing the search restores the collapsed-except-selected view. The "Show all N models" affordance is restyled as a distinct "+ Show all N models" expander (muted italic, indented, not mistakable for a selectable model) and now reveals the overflow in place — the group stays open and the view scrolls to the newly-revealed models instead of resetting to the top. The redundant per-row provider chip is suppressed for rows already under their own provider heading (kept only for hoisted/search rows). Builds on @akrhin's collapsible-groups work.
+
+### Fixed
+
+- **Non-model credential-pool keys no longer appear as phantom providers in the model picker (#4324).** A regression from #4247: the credential-pool detection loop added *every* `auth.json` → `credential_pool` key to the detected providers without checking it names a model provider. The Photon iMessage plugin writes three such keys (`photon`, `photon_project`, `photon_user`) that are messaging-platform credentials, not LLM API keys — so the picker showed three bogus "providers" (`photon`, `photon project`, `photon user`) each listing the full auto-detected model catalog. Pool detection is now gated on a new `_is_known_model_provider()` check (a `custom:*` slug, a static `_PROVIDER_DISPLAY`/`_PROVIDER_MODELS` entry, or a registered model-provider plugin) on both the `load_pool` and raw-dict fallback paths, and the group-builder's generic fallback no longer paints an unrecognized id with the global catalog. Real pool-keyed providers (`copilot`, aliased `google`→`gemini`) still surface. Reported by Nic; fix by @nesquena-hermes and independently by @rodboev (#4329/#4330).
+
+## [v0.51.463] — 2026-06-16 — Release PX (tighter remote workspace boundaries)
+
+### Fixed
+
+- **Remote POSIX workspace trust boundaries are hardened (#3664).** The remote-terminal workspace containment check now normalizes both the candidate path and `terminal.cwd` before comparing, so a lexical `..` escape (e.g. `{cwd}/../other/...`) no longer slips past the containment check. The blocked-system-root gate was also restored below the home-directory allow-list in both workspace validators, so legitimate systemd-homed paths under `/var/home/<user>/...` stay allowed while system directories remain blocked. POSIX path shapes are normalized at the source so every downstream block probe is consistent (`/etc/../home/user` → `/home/user`, `/./etc/ssh` → `/etc/ssh`). Workspace paths containing an embedded null byte now fail closed with a clean validation error instead of surfacing a 500 (at both the workspace validators and the `/api/workspaces/add` route preflight), and the add-workspace route now applies the same home-directory carve-out as the validators so systemd-homed workspaces under `/var/home/<user>/...` register correctly. Thanks @rodboev.
+
+## [v0.51.462] — 2026-06-16 — Release PW (sidebar survives slow loads)
+
+### Fixed
+
+- **The conversation sidebar no longer vanishes during slow or resilient session loads (#4167).** A slow `/api/sessions` response could leave the sidebar empty; it now keeps the list visible and shows a retryable error state (with an opt-in request retry) instead of blanking out. Read-only sessions (imported CLI and Claude Code sessions) correctly keep their rename/action-menu/swipe suppression and the detailed gateway model label renders, both of which had been dropped from the sidebar payload. And when a refresh fails right after switching profiles, the sidebar shows the error state rather than briefly re-rendering the previous profile's conversations. Thanks @ai-ag2026.
+
+## [v0.51.461] — 2026-06-16 — Release PV (custom-provider keys recognized from the pool)
+
+### Fixed
+
+- **Custom and aliased providers with credential-pool keys now show as configured (#4247).** Providers whose API keys live in the credential pool (added via `hermes auth add`) rather than env vars were reported unconfigured in the WebUI, so their models didn't appear. Provider detection now also consults the credential pool via `_has_explicit_pool_credentials()`, which filters the ambient `gh auth token` entry (so Copilot no longer falsely shows configured on any machine with `gh` installed) and is cache-routed to avoid the cold per-provider pool-load latency. Provider aliases (`glm`→`zai`, `github`→`copilot`, etc.) are resolved before loading the pool at every retrieval site, so detection and key-retrieval always read the same pool. The credential-pool cache is also now scoped to the active profile, so a custom provider configured in one profile no longer shows as configured in another profile that lacks the key. Thanks @akrhin.
+
+## [v0.51.460] — 2026-06-16 — Release PU (custom voice providers recognized)
+
+### Fixed
+
+- **Command (custom) speech-to-text providers are now recognized by the voice capability probe (#4312).** When `stt.provider` pointed at a Hermes command-type STT provider, the WebUI's `/api/transcribe/capability` probe only knew the built-in providers, so it reported voice input as unavailable and the browser fell back unnecessarily. The probe now delegates command-provider recognition to the agent's own resolver (`_resolve_command_stt_provider_config`) as the single source of truth, consulted after the built-in chain. Thanks @LLMinem.
+
+## [v0.51.459] — 2026-06-16 — Release PT (your message stays your message)
+
+### Fixed
+
+- **Stale prior-turn text no longer contaminates the current user message (#4089).** When the agent's defensive role-sequence repair concatenated the previous context-tail user row with the freshly-submitted turn as `<stale>\n\n<current>`, that polluted pair was persisted into both the model context and the visible transcript — so a new message could render prefixed with an earlier one. A new detector recognizes exactly this repair shape (it requires the literal `\n\n` boundary and an exact tail/current match after workspace-sentinel stripping) and normalizes the affected row back to the clean current turn. Both the model-context merge and the visible-transcript merge funnel through one rule, and the normalization is scoped strictly to the new-turn slice — committed history rows are never rewritten. Thanks @starship-s.
+
+## [v0.51.458] — 2026-06-16 — Release PS (long sessions stop hanging)
+
+### Fixed
+
+- **Server no longer hangs on long tool-call sessions (#4314).** The transcript-backfill loop in `_merge_display_messages_after_agent_result` was O(D²·C): it re-ran `_message_identity` (`json.dumps`) for every future display row on every outer iteration and used an O(N) list-slice membership test. On sessions with many tool-call turns this pegged a CPU core, held the GIL, and stalled the `/api/sessions` sidebar poll 5–11s per cycle — the WebUI appeared hung on the current turn. The loop now precomputes display identities once and keeps an O(1) multiset mirror of the remaining context keys, making it O(D²). Behavior is unchanged: the multiset preserves the exact membership semantics of the original list-slice (including duplicate-identity turns and empty rows), verified by a differential regression test. Thanks @psanger.
+
+## [v0.51.457] — 2026-06-16 — Release PR (gateway watcher can't brick startup)
+
+### Fixed
+
+- **Gateway watcher startup is now non-blocking (#4297).** `start_watcher()` ran synchronously in `main()` during boot, so if `_resolve_watcher_target()` stalled (a locked `state.db`, slow profile/home resolution, or an I/O block) the WebUI would never bind its port — a startup brick. It now starts on a daemon thread with a 5-second join, so the server proceeds to bind even when watcher initialization is slow; the watcher's own poll loop already ran on a separate daemon thread, so real-time SSE liveness is unchanged. Thanks @minidarkmimi.
+
 ### Internal
 
 - **Windows pytest-harness compatibility (#3664).** Hardened the test suite to run on Windows: profile-home fallback paths are path-normalized, strict POSIX file-mode (`0o600`) assertions are gated behind `os.name != "nt"` (Linux still asserts them at full strictness), the conftest cleanup handles Windows process-tree/port teardown and the Py3.12+ `shutil.rmtree` `onexc` shim, and tests that require `fork`/`fcntl` carry `@requires_fork` / `@requires_fcntl` markers (which never skip on Linux). Test-only — no runtime or app behavior change, no Linux CI behavior change. (#4254, #4255, #4256, #4257, #4259, #4263, #4266, #4274)
+
+## [v0.51.456] — 2026-06-16 — Release PQ (start.sh tells you when the server is already running)
+
+### Changed
+
+- **`./start.sh` now detects an already-running server instead of pretending to start a new one.** Previously, running `./start.sh` while a server was already bound to the host:port would have `bootstrap.py` spawn a child that fails to bind and dies, while the existing instance answered the `/health` probe — so the script reported "ready" and exited 0 without actually starting anything. `start.sh` now probes `/health` first (best-effort, 2s timeout, via `curl`/`wget`; skipped if neither is present) and, when a server already answers, prints a clear message that nothing was (re)started plus how to restart (`./ctl.sh restart`, or stop-the-PID + `./start.sh`), then exits 0. This brings the detached `start.sh` path to parity with `ctl.sh`'s existing double-start refusal. The container path (which runs `server.py` directly) is unaffected. (#4308)
+
+## [v0.51.455] — 2026-06-16 — Release PP (drop stale background-process completions instead of prepending them to a later turn)
+
+### Fixed
+
+- **A background task that finishes long after you've moved on no longer hijacks your next message.** When a `notify_on_complete` background task's completion fired after the user had left the session idle (or it sat queued), the WebUI prepended its `[IMPORTANT: … completed]` notification to whatever the user typed next — so the agent answered the *old* task and already-delivered completion notices reappeared on later turns. The notification drain now age-gates completions: one whose enqueue time is older than a configurable cap (`HERMES_WEBUI_STALE_COMPLETION_MAX_AGE_SECONDS`, default 6h; set `0` to disable) is silently consumed instead of delivered. Completions without a timestamp (older agent builds) are never dropped, so behavior is unchanged until the agent side stamps `completed_at`. (#4306, #4029)
 
 ## [v0.51.454] — 2026-06-16 — Release PO (complete the Japanese UI translation)
 

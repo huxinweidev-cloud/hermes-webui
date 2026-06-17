@@ -139,9 +139,9 @@ For self-hosted VM or homelab installs, `ctl.sh` wraps the common daemon lifecyc
 >
 > | Launch method | How to stop |
 > |---|---|
-> | `python3 bootstrap.py` or `./start.sh` | **Ctrl-C** in the terminal (both run in the foreground) |
+> | `python3 bootstrap.py` | **Ctrl-C** in the terminal (runs in the foreground) |
 > | `./ctl.sh start` | `./ctl.sh stop` (sends SIGTERM, waits, then SIGKILL) |
-> | Detached `bootstrap.py` (no `--foreground`) | Find the PID via `lsof -i :8787` (or `ss -tlnp`) and `kill` it |
+> | Detached `bootstrap.py` (no `--foreground`) or `./start.sh` | Find the PID via `lsof -i :8787` (or `ss -tlnp`) and `kill` it |
 >
 > `./ctl.sh stop` cannot stop a server launched by `bootstrap.py` or `start.sh` directly — it only manages processes it started itself.
 
@@ -624,10 +624,10 @@ Over **248 contributors** have shipped code that landed in a release tag. The fu
 
 | # | Contributor | PRs | First → latest release |
 |---|---|---:|---|
-| 1 | [@franksong2702](https://github.com/franksong2702) | 181 | `v0.49.3` → `v0.51.384` |
+| 1 | [@franksong2702](https://github.com/franksong2702) | 181 | `v0.49.3` → `v0.51.405` |
 | 2 | [@Michaelyklam](https://github.com/Michaelyklam) | 118 | `v0.50.240` → `v0.51.198` |
-| 3 | [@rodboev](https://github.com/rodboev) | 83 | `v0.51.223` → `v0.51.384` |
-| 4 | [@ai-ag2026](https://github.com/ai-ag2026) | 75 | `v0.50.279` → `v0.51.367` |
+| 3 | [@rodboev](https://github.com/rodboev) | 97 | `v0.51.223` → `v0.51.414` |
+| 4 | [@ai-ag2026](https://github.com/ai-ag2026) | 79 | `v0.50.279` → `v0.51.425` |
 | 5 | [@bergeouss](https://github.com/bergeouss) | 70 | `v0.48.0` → `v0.51.385` |
 | 6 | [@AJV20](https://github.com/AJV20) | 34 | `v0.51.93` → `v0.51.227` |
 | 7 | [@dso2ng](https://github.com/dso2ng) | 30 | `v0.50.227` → `v0.51.327` |

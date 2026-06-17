@@ -1739,10 +1739,7 @@ def _session_list_payload_to_response(payload: dict) -> dict:
     safe_merged = []
     runtime_rows = _session_list_cache_overlay_runtime_rows(payload.get("sessions", []) or [])
     for s in runtime_rows:
-        item = dict(s) if isinstance(s, dict) else {}
-        if isinstance(item.get("title"), str):
-            item["title"] = _redact_text(item["title"])
-        item["attention"] = _session_attention_summary(str(item.get("session_id") or ""))
+        item = _sidebar_session_response_item(s) if isinstance(s, dict) else {}
         safe_merged.append(item)
     return {
         "sessions": safe_merged,
@@ -4583,6 +4580,46 @@ def _normalize_sidebar_source_flags(session: dict) -> dict:
     return normalized
 
 
+def _reconcile_session_detail_source_flags(session: dict, state_meta: dict) -> dict:
+    """Return a /api/session payload whose source flags match state.db truth.
+
+    WebUI-origin sidecars can carry stale CLI/import flags after older repair or
+    import paths touched the JSON file. The sidebar projection already trusts the
+    state.db source row for those sessions; the detail endpoint must do the same
+    or the frontend opens a WebUI-native transcript as an external session and
+    starts the destructive active-refresh reload loop.
+    """
+    if not isinstance(session, dict):
+        return session
+    if not _session_source_is_webui(state_meta):
+        return dict(session)
+
+    reconciled = dict(session)
+    reconciled["is_cli_session"] = False
+    reconciled["read_only"] = False
+    reconciled["source_tag"] = _safe_first(state_meta.get("source_tag"), "webui")
+    reconciled["raw_source"] = _safe_first(state_meta.get("raw_source"), "webui")
+    reconciled["session_source"] = _safe_first(state_meta.get("session_source"), "webui")
+    reconciled["source_label"] = _safe_first(state_meta.get("source_label"), "WebUI")
+    if state_meta.get("source"):
+        reconciled["source"] = state_meta["source"]
+
+    for key in ("message_count", "actual_message_count"):
+        if state_meta.get(key) is not None:
+            reconciled[key] = max(
+                _numeric_count(reconciled.get(key)),
+                _numeric_count(state_meta.get(key)),
+            )
+    for key in ("created_at", "updated_at", "last_message_at"):
+        if state_meta.get(key) is not None:
+            current = reconciled.get(key)
+            try:
+                reconciled[key] = max(float(current or 0), float(state_meta.get(key) or 0))
+            except (TypeError, ValueError):
+                reconciled[key] = state_meta[key]
+    return reconciled
+
+
 def _session_source_is_webui(session: dict) -> bool:
     """Return True for state.db/sidebar rows that describe WebUI-origin sessions."""
     if not isinstance(session, dict):
@@ -4832,6 +4869,8 @@ from api.workspace import (
     make_anchored_dir,
     validate_workspace_to_add,
     _is_blocked_system_path,
+    _home_path,
+    _is_within,
     _strip_surrounding_quotes,
     _is_remote_terminal_backend,
     _workspace_blocked_roots,
@@ -4941,6 +4980,91 @@ def _session_attention_summary(session_id: str) -> dict | None:
             "severity": "question",
         }
     return None
+
+
+_SIDEBAR_SESSION_RESPONSE_FIELDS = {
+    "session_id",
+    "title",
+    "display_title",
+    "_state_db_title",
+    "workspace",
+    "model",
+    "model_provider",
+    "message_count",
+    "user_message_count",
+    "created_at",
+    "updated_at",
+    "last_message_at",
+    "pinned",
+    "archived",
+    "project_id",
+    "profile",
+    "input_tokens",
+    "output_tokens",
+    "estimated_cost",
+    "cache_read_tokens",
+    "cache_write_tokens",
+    "cache_hit_percent",
+    "personality",
+    "context_length",
+    "config_context_length",
+    "window_usage_percent",
+    "source_tag",
+    "raw_source",
+    "session_source",
+    "source_label",
+    "is_cli_session",
+    "is_messaging_session",
+    "is_streaming",
+    "active_stream_id",
+    "has_pending_user_message",
+    "pending_started_at",
+    "default_hidden",
+    "worktree_path",
+    "worktree_branch",
+    "parent_session_id",
+    "parent_title",
+    "parent_source",
+    "relationship_type",
+    "pre_compression_snapshot",
+    "_lineage_root_id",
+    "_lineage_tip_id",
+    "_compression_segment_count",
+    "_lineage_collapsed_count",
+    "_parent_lineage_root_id",
+    "_cross_surface_child_session",
+    "match_type",
+    "match_preview",
+    # Preserved so the sidebar can suppress rename / action-menu / swipe on
+    # read-only (imported CLI + Claude Code) sessions, and render the detailed
+    # gateway model label. Dropping these silently regressed both surfaces.
+    # Only the latest `gateway_routing` is included (the sidebar label reader
+    # prefers it); the unbounded `gateway_routing_history` is intentionally NOT
+    # sent in the list payload to avoid per-row bloat.
+    "read_only",
+    "is_read_only",
+    "gateway_routing",
+}
+
+
+def _sidebar_session_response_item(session: dict, *, redact_enabled: bool | None = None) -> dict:
+    """Return the bounded /api/sessions row shape used by the sidebar.
+
+    Full session/detail fields such as messages, tool calls, compression
+    summaries, context-engine state, gateway routing history, drafts, and
+    pending user text are intentionally excluded from the list endpoint. Large
+    installs should not ship tens of KB of per-row detail just to render a
+    conversation title.
+    """
+    item = {
+        key: value
+        for key, value in dict(session).items()
+        if key in _SIDEBAR_SESSION_RESPONSE_FIELDS
+    }
+    if isinstance(item.get("title"), str):
+        item["title"] = _redact_text(item["title"], _enabled=redact_enabled)
+    item["attention"] = _session_attention_summary(str(item.get("session_id") or ""))
+    return item
 
 
 # ── Login page locale strings ─────────────────────────────────────────────────
@@ -6737,7 +6861,9 @@ def handle_get(handler, parsed) -> bool:
         return j(handler, get_available_models())
 
     if parsed.path == "/api/models/live":
-        return _handle_live_models(handler, parsed)
+        from api.profiles import profile_env_for_active_request
+        with profile_env_for_active_request("/api/models/live", logger_override=logger):
+            return _handle_live_models(handler, parsed)
 
     # ── Auxiliary models (GET/POST) ──
     if parsed.path == "/api/model/auxiliary":
@@ -7119,7 +7245,9 @@ def handle_get(handler, parsed) -> bool:
                     float(raw.get("updated_at") or 0),
                     _merged_last_message_at,
                 )
-            if cli_meta and _is_messaging_session_record(cli_meta):
+            if cli_meta and _session_source_is_webui(cli_meta):
+                raw = _reconcile_session_detail_source_flags(raw, cli_meta)
+            elif cli_meta and _is_messaging_session_record(cli_meta):
                 raw = _merge_cli_sidebar_metadata(raw, cli_meta)
                 # ``message_count`` in /api/session is the display coordinate
                 # space used for pagination and the header badge. Messaging
@@ -7324,7 +7452,7 @@ def handle_get(handler, parsed) -> bool:
                 diag=diag,
             )
             diag.stage("response_write")
-            return j(handler, _session_list_payload_to_response(payload))
+            return j(handler, _session_list_payload_to_response(payload), pretty=False)
         finally:
             diag.finish()
 
@@ -11149,6 +11277,7 @@ def _handle_tts(handler, parsed):
     voice = "zh-CN-XiaoxiaoNeural"
     rate_str = ""
     pitch_str = ""
+    engine = "edge"  # "edge" | "elevenlabs" | "browser" (browser is client-side only)
 
     if handler.command != "POST":
         from api.helpers import bad as _bad
@@ -11160,6 +11289,7 @@ def _handle_tts(handler, parsed):
         voice = data.get("voice") or voice
         rate_str = _normalize_tts_prosody(data.get("rate"), unit="%")
         pitch_str = _normalize_tts_prosody(data.get("pitch"), unit="Hz")
+        engine = (data.get("engine") or "edge").strip().lower()
     except Exception:
         from api.helpers import bad as _bad
         return _bad(handler, "invalid request body", 400)
@@ -11232,6 +11362,90 @@ def _handle_tts(handler, parsed):
         from api.helpers import bad as _bad
         return _bad(handler, "rate limit exceeded — please wait", 429)
 
+    # ── ElevenLabs TTS ──────────────────────────────────────────────────
+    if engine == "elevenlabs":
+        api_key = os.getenv("ELEVENLABS_API_KEY", "").strip()
+        if not api_key:
+            # Fall back to reading from Hermes .env file
+            try:
+                from api.onboarding import _load_env_file
+                from api.profiles import get_active_hermes_home
+                api_key = _load_env_file(get_active_hermes_home() / ".env").get("ELEVENLABS_API_KEY", "")
+            except Exception:
+                pass
+        if not api_key:
+            from api.helpers import bad as _bad
+            return _bad(handler, "ELEVENLABS_API_KEY not configured", 503)
+
+        # Resolve voice_id from Hermes config.yaml → env fallback
+        voice_id = "pNInz6obpgDQGcFmaJgB"  # Adam (same default as hermes-agent config.yaml)
+        model_id = "eleven_multilingual_v2"
+        try:
+            from api.config import get_config
+            tts_cfg = (get_config() or {}).get("tts", {})
+            if isinstance(tts_cfg, dict):
+                el_cfg = tts_cfg.get("elevenlabs", {})
+                if isinstance(el_cfg, dict):
+                    voice_id = el_cfg.get("voice_id", voice_id)
+                    model_id = el_cfg.get("model", model_id) or el_cfg.get("model_id", model_id)
+                    # ^ treat empty string as "not set" — fall through to default
+        except Exception:
+            pass  # fall back to defaults
+
+        # Validate voice_id is a safe path segment (no traversal)
+        # fullmatch (not match) so a trailing newline can't slip past the `$`
+        # anchor — defense-in-depth on the config-derived voice_id before it
+        # goes into the request URL (#3510 review).
+        if not re.fullmatch(r'[A-Za-z0-9_-]+', voice_id):
+            from api.helpers import bad as _bad
+            return _bad(handler, "invalid voice_id in config", 400)
+
+        url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}/stream?output_format=mp3_44100_128"
+        req_body = json.dumps({
+            "text": text,
+            "model_id": model_id,
+            "voice_settings": {"stability": 0.5, "similarity_boost": 0.75},
+        }).encode("utf-8")
+
+        from urllib.request import Request, urlopen as _urlopen
+
+        req = Request(url, data=req_body, headers={
+            "xi-api-key": api_key,
+            "Content-Type": "application/json",
+            "Accept": "audio/mpeg",
+        })
+
+        # Buffer the full response before sending first byte.
+        # The streaming endpoint is designed for chunked delivery, but urllib's
+        # chunked-read path adds per-chunk overhead that dominates short TTS
+        # payloads. With the 5000-char cap enforced above the buffer is bounded
+        # (a few MB of mp3 worst case), so full-buffer-then-send is faster in
+        # practice and simpler to reason about.
+        audio_data = b""
+        try:
+            with _urlopen(req, timeout=30) as resp:
+                while True:
+                    chunk = resp.read(65536)
+                    if not chunk:
+                        break
+                    audio_data += chunk
+        except Exception:
+            logger.exception("ElevenLabs TTS generation failed")
+            from api.helpers import bad as _bad
+            return _bad(handler, "ElevenLabs TTS generation failed", 500)
+
+        handler.send_response(200)
+        handler.send_header("Content-Type", "audio/mpeg")
+        handler.send_header("Cache-Control", "no-store")
+        handler.send_header("Content-Length", str(len(audio_data)))
+        handler.end_headers()
+        try:
+            handler.wfile.write(audio_data)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        return True
+
+    # ── Edge TTS ────────────────────────────────────────────────────────
     allowed = {
         "zh-CN-XiaoxiaoNeural", "zh-CN-XiaoyiNeural", "zh-CN-YunxiNeural",
         "zh-CN-YunjianNeural", "zh-CN-YunyangNeural",
@@ -12427,6 +12641,23 @@ def _handle_live_models(handler, parsed):
                     _model_cfg = cfg.get("model", {})
                     _base_url = _model_cfg.get("base_url")
                     _api_key = _model_cfg.get("api_key")
+                # Fallback: try credential pool for base_url + api_key
+                if (not _base_url or not _api_key) and provider.startswith("custom:"):
+                    try:
+                        from api.config import _has_explicit_pool_credentials, _resolve_provider_alias
+                        if _has_explicit_pool_credentials(provider):
+                            from agent.credential_pool import load_pool as _lpool
+                            _resolved = _resolve_provider_alias(provider)
+                            _lm_pool = _lpool(_resolved)
+                            if _lm_pool:
+                                _lm_entry = _lm_pool.select()
+                                if _lm_entry:
+                                    if not _api_key:
+                                        _api_key = getattr(_lm_entry, "runtime_api_key", "") or ""
+                                    if not _base_url:
+                                        _base_url = str(getattr(_lm_entry, "base_url", "") or "").strip()
+                    except ImportError:
+                        pass
                 if _base_url and _api_key:
                     try:
                         import urllib.request
@@ -14325,6 +14556,7 @@ def _handle_chat_sync(handler, body):
         _next_context_messages = _dedupe_replayed_context_messages(
             _previous_context_messages,
             _next_context_messages,
+            msg,
         )
         s.context_messages = _next_context_messages
         s.messages = _merge_display_messages_after_agent_result(
@@ -15420,9 +15652,23 @@ def _handle_workspace_add(handler, body):
     # _is_blocked_system_path honours user-tmp carve-outs (e.g. /var/folders on
     # macOS) so pytest's tmp_path_factory paths and other legit user-tmp dirs
     # still register cleanly.
-    candidate = Path(path_str).expanduser().resolve()
+    try:
+        candidate = Path(path_str).expanduser().resolve()
+    except (ValueError, OSError, RuntimeError) as e:
+        # Invalid path (e.g. embedded null byte) — fail closed with a clean 400
+        # instead of letting .resolve() raise an uncaught 500.
+        return bad(handler, f"Invalid path: {_sanitize_error(e)}")
     if _is_blocked_system_path(candidate):
-        return bad(handler, f"Path points to a system directory: {candidate}")
+        # Home-directory carve-out, mirroring the validators
+        # (resolve_trusted_workspace / validate_workspace_to_add): a workspace
+        # at or under the active user's home must stay allowed even when that
+        # home lives under an otherwise-blocked root (e.g. systemd-homed
+        # /var/home/<user>/...). Without this the route rejects valid
+        # /var/home workspaces before validate_workspace_to_add()'s carve-out
+        # can run.
+        _home = _home_path()
+        if not (_home != Path("/") and (candidate == _home or _is_within(candidate, _home))):
+            return bad(handler, f"Path points to a system directory: {candidate}")
     # Now safe to create the directory if requested
     if auto_create:
         try:
