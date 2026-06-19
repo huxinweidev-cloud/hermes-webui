@@ -3,6 +3,12 @@
 
 ## [Unreleased]
 
+## [v0.51.524] — 2026-06-19 — Release SI (opt-in chunked SSE for buffering reverse proxies)
+
+### Added
+
+- **Opt-in chunked transfer-encoding for SSE streams, so live streams survive buffering reverse proxies (#4447).** Tornado-based proxies (notably `jupyter-server-proxy`, which fronts the WebUI in JupyterHub/REANA deployments) read the stdlib server's unframed SSE body with read-until-close semantics and buffer the entire stream until the connection dies, so chat appears frozen until the client's watchdog kills it. Setting `HERMES_WEBUI_SSE_CHUNKED=1` makes each SSE event a discrete HTTP/1.1 chunk so it flushes through every hop immediately. Default-off: when unset, the wire format is byte-for-byte unchanged, so directly-served deployments are unaffected. Thanks @tomtong2015.
+
 ## [v0.51.523] — 2026-06-19 — Release SH (cache trusted wiki page listings on browser reads)
 
 ### Changed
