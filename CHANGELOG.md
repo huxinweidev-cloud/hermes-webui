@@ -3,6 +3,142 @@
 
 ## [Unreleased]
 
+## [v0.51.535] — 2026-06-20 — Release ST (open model picker stays stable during stream sync)
+
+### Fixed
+
+- **The open model picker no longer jumps/rebuilds during streaming when the model hasn't changed (#4531).** Streamed updates reapply the session model through both the start-data path and `syncTopbar()`, which rebuilt the open picker every time even though nothing changed — losing your scroll position in the list. `_applyModelToDropdown` now rebuilds the open picker only when the resolved model or provider actually differs from the current selection, and the live-models-arrived path avoids a duplicate rebuild when the catalog-growth refresh already re-applied the session model (the force-refresh on catalog growth still preserves #1169 — the session model wins over a premature fallback). Thanks @rodboev.
+
+## [v0.51.534] — 2026-06-20 — Release SS (clarify prompt no longer bricks the session on expiry)
+
+### Fixed
+
+- **An expired clarify prompt no longer locks up the session (#4504).** When a clarify prompt's countdown hit zero, the agent cleared server state but the browser kept the clarify card docked and the composer locked, and the only escape — submitting — was rejected with `409 {stale: true}`, leaving the session stuck until a reload. The client now treats a 409 on submit as terminal: it re-enables the composer, hands the typed draft back to it, and dismisses the stale card. The dismissal is guarded by the same `clarify_id` check the success path uses, so a late 409 for an expired prompt can't tear down a newer prompt that already rendered (#2639 preserved); and the composer's loading state is cleared before the draft is stashed so the typed answer is never silently dropped. `clear_pending` also emits an SSE notify for any future stream subscriber. Thanks @Sanjays2402.
+
+## [v0.51.533] — 2026-06-20 — Release SR (restart the gateway from the agent-health alert)
+
+### Added
+
+- **Restart the messaging gateway directly from the WebUI when its heartbeat fails (#3285).** When the agent-health alert appears (the gateway heartbeat stopped), it now offers a "Restart Service" button alongside Dismiss. It calls a new authenticated `POST /api/health/restart` that runs `hermes gateway restart` (graceful drain of in-flight runs) for the active profile's `HERMES_HOME`. The endpoint is guarded by a non-blocking lock (concurrent restarts get a 429), returns quickly when the restart completes fast, and otherwise lets the drain finish in the background with a timeout; the client suppresses health-polling for 15s afterward so the alert doesn't flicker during the restart. Thanks @Chukwuebuka-2003.
+
+## [v0.51.532] — 2026-06-20 — Release SQ (built-in personalities on non-default profiles)
+
+### Fixed
+
+- **Non-default profiles now see the built-in personalities too (follow-up to #4465, closes the #4513 gap).** v0.51.525 hydrated the 14 built-in personalities for the default profile, but `get_config_for_profile_home()` — used by the streaming worker to resolve a non-default profile's config — was a pure file read with no defaults applied, so a fresh non-default profile still resolved `personalities: []`. It now applies the documented config defaults (including the built-ins) to the per-profile read, matching the ambient `get_config()` shape, without mutating any global cache. A non-existent profile home returns an empty dict. Thanks @franksong2702.
+
+## [v0.51.531] — 2026-06-20 — Release SP (plugins panel: correct active-provider badge)
+
+### Fixed
+
+- **The Settings → Plugins panel now shows the green "Active provider" badge only on the provider that's actually selected (#4496).** Exclusive provider plugins (e.g. memory backends) all report `enabled: false` by design, so the panel couldn't tell the *selected* provider from its inactive siblings — it badged any exclusive plugin as the active provider. The payload now carries an `is_active_provider` signal (computed from the category's `<category>.provider` config) and the panel badges only the selected one; unselected exclusive providers render as "Disabled". Flat-key exclusive plugins (where the category can't be inferred) keep the older activation-based badge, so nothing regresses. Thanks @franksong2702.
+
+## [v0.51.530] — 2026-06-20 — Release SO (fix /api/profiles 500)
+
+### Fixed
+
+- **`GET /api/profiles` no longer returns a 500 (UnboundLocalError).** A later branch in the request handler imports `get_active_profile_name` as a function-local, which made the name local across the whole handler; the `/api/profiles` branch referenced it before that import ran, so every call to the profiles list endpoint raised `UnboundLocalError`. The branch now imports the name it uses directly. Regression introduced in v0.51.528 and surfaced once the redundant local import was removed there; this restores the profiles list/dropdown. Thanks @MinhoJJang.
+
+## [v0.51.529] — 2026-06-20 — Release SN (per-response jump button matches the session jump pill)
+
+### Fixed
+
+- **The per-response "jump to question" button now matches the session jump pill instead of rendering as a smaller, inconsistent control (#2246 follow-up).** The response jump button reuses the session jump button's class stack and dimensions (height, padding, border, background, hover lift), so the two jump affordances look like one consistent control; on mobile (≤600px) it collapses to the same 32px circular icon button as the session pill. Thanks @TomBanksAU.
+
+## [v0.51.528] — 2026-06-20 — Release SM (isolated HERMES_HOME single-profile mode)
+
+### Added
+
+- **Pin the WebUI to a single profile by pointing `HERMES_HOME` at a profile directory (#2698).** When `HERMES_HOME` resolves to `~/.hermes/profiles/<name>` at startup, the WebUI now runs in isolated single-profile mode: it lists only that profile, rejects cross-profile switch/create/delete (403), scopes the WebUI state directory to `<HERMES_HOME>/webui` (so even a profile literally named `default` gets its own sessions/state rather than sharing the root profile's), forces `?all_profiles=1` aggregate reads off (no cross-profile session/project leak), and hides the multi-profile UI affordances (New-profile button, profile dropdown, Manage link). A normal install — `HERMES_HOME` unset or pointing at the base `~/.hermes` — is unaffected: isolation stays off and the state directory and multi-profile behavior are unchanged. Thanks @rodboev (state-dir contract folded in from @tomtong2015's #4449).
+
+## [v0.51.527] — 2026-06-19 — Release SL (completion notifications survive a backgrounded tab)
+
+### Fixed
+
+- **Desktop notifications no longer get silently dropped when the agent finishes while you're on another tab (#4416).** Chromium throttles a background tab's SSE, so the stream's `done` event is delivered late — after you return to the tab, when `document.hidden` already reads `false` — and the response-complete notification was suppressed by the live visibility check. The WebUI now tracks whether the tab was hidden at *any* point during a stream and notifies on that basis, so a turn you stepped away from still notifies on completion. A turn you watched the whole time stays silent (matching how Slack/Discord/Gmail/Claude behave), and the user's notifications-enabled setting is still honored.
+
+## [v0.51.526] — 2026-06-19 — Release SK (the "Running" indicator clears when the server is idle)
+
+### Fixed
+
+- **The "Running" indicator no longer stays stuck after the stream dies during a provider retry (#4354).** Three client-side guards keyed on the local `_sendInProgress`/`_sendInProgressSid` flags could keep a session marked busy (and keep a stale `INFLIGHT` entry alive) even after the server reported the run idle. The idle reconciler and the stale-INFLIGHT purge now treat the server's `is_streaming=false` as authoritative, and `loadSession` only asserts `S.busy` when the server confirms an active stream — so a session whose stream died mid-retry stops showing a spinner without needing a reload. Thanks @bergeouss.
+
+## [v0.51.525] — 2026-06-19 — Release SJ (built-in personalities available in WebUI)
+
+### Added
+
+- **The 14 built-in agent personalities now show up in the WebUI without hand-editing config.yaml (#4465).** WebUI resolved the `/personality` list from config only, so a fresh profile saw an empty list even though the CLI ships built-ins (helpful, concise, technical, creative, teacher, and the playful set). The WebUI config loader now hydrates the same built-ins as a default (user-defined personalities still override a built-in of the same name), and config saves strip the generated built-ins back out — so `config.yaml` only ever persists your *custom* personalities, never the defaults. Thanks @franksong2702.
+
+## [v0.51.524] — 2026-06-19 — Release SI (opt-in chunked SSE for buffering reverse proxies)
+
+### Added
+
+- **Opt-in chunked transfer-encoding for SSE streams, so live streams survive buffering reverse proxies (#4447).** Tornado-based proxies (notably `jupyter-server-proxy`, which fronts the WebUI in JupyterHub/REANA deployments) read the stdlib server's unframed SSE body with read-until-close semantics and buffer the entire stream until the connection dies, so chat appears frozen until the client's watchdog kills it. Setting `HERMES_WEBUI_SSE_CHUNKED=1` makes each SSE event a discrete HTTP/1.1 chunk so it flushes through every hop immediately. Default-off: when unset, the wire format is byte-for-byte unchanged, so directly-served deployments are unaffected. Thanks @tomtong2015.
+
+## [v0.51.523] — 2026-06-19 — Release SH (cache trusted wiki page listings on browser reads)
+
+### Changed
+
+- **The LLM Wiki browse/read endpoints no longer re-walk the entire wiki tree on every request (#4375).** `/api/wiki/page` and `/api/wiki/browse` rebuilt the trusted page allowlist by walking up to 10k files (with a `stat` each) on every call (#3576 hardening). The walk result is now memoized in a short-TTL (5s) in-process cache keyed on the resolved wiki root with a section-dir change signature. The cache only memoizes which page names are candidates — the per-request read path still re-resolves each entry, re-asserts containment under the real wiki root (with dotfile exclusion), and gates the actual read behind the existing `O_NOFOLLOW` open + inode-identity check, so a cached entry can never bypass a containment check the fresh walk would apply.
+
+### Security
+
+- **Hardlinked wiki page files are now rejected from the allowlist and read revalidation (#4375).** `O_NOFOLLOW` plus inode-identity cannot distinguish a hardlink at a clean `*.md` page name from the real page, so a multi-link file at a listed name could carry an arbitrary inode (including one outside the wiki) through the read check. Any page file with `st_nlink > 1` is now excluded during both the allowlist walk and the read-path revalidation. Thanks @rodboev.
+
+## [v0.51.522] — 2026-06-19 — Release SG (live model lookups never forward another provider's key)
+
+### Security
+
+- **`/api/models/live` no longer forwards the active provider's API key to a different provider's endpoint (#4488).** When a live-model lookup for provider X had no provider-scoped `providers.X.api_key`, the OpenAI-compat fallback used the top-level `model.api_key` unconditionally — which may belong to a different provider Y — and sent it as a bearer token to X's `{endpoint}/models` URL, leaking Y's credential to X's server. The fallback is now gated on the active `model.provider` resolving (via the same alias normalization) to the requested provider; on a mismatch no key is used, no request is made, and the static catalog is returned. Thanks @Hinotoi-agent.
+
+## [v0.51.521] — 2026-06-19 — Release SF (imported sessions scoped to the active profile)
+
+### Security
+
+- **Sessions imported under a named profile are now owned by that profile, not by root/default (#4489).** `/api/session/import` validates the workspace under the request's active profile but built the new `Session` with no `profile`, so it defaulted to `None` (root/default-owned). A default/root request could then export the imported transcript or use its session id to read files from the named-profile workspace — a cross-profile leak. The import now stamps `profile=get_active_profile_name()`, so the boundary check denies (404) a mismatched profile. The default profile keeps its existing ownership semantics. Thanks @Hinotoi-agent.
+
+## [v0.51.520] — 2026-06-19 — Release SE (recover from untracked-file update collisions)
+
+### Fixed
+
+- **An update blocked by an untracked-file collision now offers a recovery path instead of leaving the user stuck (#4310).** When `git pull` fails with "untracked working tree files would be overwritten by merge", the update response now flags the conflict so the UI surfaces the existing Force-update button (the normal path still destroys nothing). Force-update clears untracked colliders with `git clean -fd` (without `-x`, so ignored build/cache artifacts survive) before resetting, aborts before the hard reset if the clean fails, and its confirmation dialog now explicitly discloses that untracked files will be deleted. Thanks @rodboev.
+
+## [v0.51.519] — 2026-06-19 — Release SD (reconcile stale active-run registry entries)
+
+### Fixed
+
+- **A genuinely-dead streaming run no longer lingers in the active-run registry advertising a half-alive state (#4492).** When a run passed the bounded unwind ceiling, `_active_run_stream_for_session` already declined to block a successor turn on it, but the zombie entry stayed in `ACTIVE_RUNS`, so health and recovery polling kept seeing it. It now reconciles those entries out of the registry — but only when the worker is truly gone from the live `STREAMS` map, so a long turn that is merely mid-teardown keeps its lifecycle row. `cancel_stream` also stamps the run `phase="cancelling"` immediately so the registry reflects the cancel during the detached teardown window. Thanks @ai-ag2026.
+
+## [v0.51.518] — 2026-06-19 — Release SC (read-only memory writes report 403, not 500)
+
+### Fixed
+
+- **Writing to a read-only memory file now returns an actionable 403 instead of an opaque 500 (#4480).** On a fresh two-container install, `SOUL.md` can land mode `0444` (or on a read-only mounted volume), so saving from the Memory tab raised a `PermissionError`/`EROFS` that bubbled up as a generic 500. `/api/memory/write` now catches those two cases and returns a 403 naming the file, its mode, and a `chmod 644` / fix-ownership hint; any other `OSError` is still re-raised unchanged, and the existing symlinked-target guard is preserved. Thanks @franksong2702.
+
+## [v0.51.517] — 2026-06-19 — Release SB (multi-container gateway URL config)
+
+### Fixed
+
+- **Cron jobs and gateway-backed features are reachable again in multi-container deployments (#4483).** The two- and three-container compose files now set `HERMES_API_URL=http://hermes-agent:8642` on the `hermes-webui` service, which `api/agent_health.py` consumes to locate the gateway — without it, a multi-container setup showed a spurious "gateway not configured" banner and couldn't reach cron jobs. The single-container default is unchanged (the var is unset there, falling back to local checks), and `docs/docker.md`'s stale `hermes:8642` default is corrected to `hermes-agent:8642`. Thanks @franksong2702.
+
+## [v0.51.516] — 2026-06-19 — Release SA (stage per-session toolsets before the first message)
+
+### Fixed
+
+- **The composer Tools chip can now stage per-session toolsets before the first conversation exists (#4490).** Applying a custom toolset from the empty composer stores it for the next new session instead of silently no-oping (the documented per-session override #493 was unreachable on a brand-new session), `/api/session/new` now accepts the staged `enabled_toolsets` value with the same structural validation as `/api/session/toolsets`, and staged values are cleared on workspace/profile context switches and when a real session loads so they cannot leak into an unrelated later New Chat. Thanks @franksong2702.
+
+## [v0.51.515] — 2026-06-19 — Release RZ (remote-gateway approvals work again + conversation history threaded)
+
+### Fixed
+
+- **Approval controls in remote-gateway sessions now actually resume the run (#4479).** Approve/Deny in a session backed by a remote gateway (the runs-API bridge added in #4229) posted to `/v1/runs/{run_id}/approvals/{approval_id}/respond`, which the gateway never registered — every response returned 404 and the run stalled silently. The WebUI now posts to the real `/v1/runs/{run_id}/approval` endpoint (with the approval id in the request body), matching the gateway contract. Prior conversation history is also threaded into the runs-API request so the gateway agent has the same context as a local run. Thanks @rodboev.
+
+## [v0.51.514] — 2026-06-19 — Release RY (post-start UI errors no longer hide a live stream)
+
+### Fixed
+
+- **A UI error after a chat starts no longer hides the already-running live stream (#4481).** All post-`/api/chat/start` UI bookkeeping (title update, model-dropdown sync, session-list refresh, inflight bookkeeping) used to run inside the same `try{}` as the start request, so a synchronous UI throw after the server had already started the run was misreported as a send failure — it pushed an `**Error:**` bubble, cleared the busy state, and never attached the live stream, leaving the in-progress reply hidden until a reload. The start request is now the only call inside that `try{}`; the live stream is always attached whenever the server returns a `stream_id`, and the optional UI bookkeeping runs in a separate error-swallowing step that can't suppress the stream. Thanks @franksong2702.
+
 ## [v0.51.513] — 2026-06-19 — Release RX (credential-pool quota status for all pooled providers)
 
 ### Added
