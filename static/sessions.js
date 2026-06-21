@@ -1103,6 +1103,16 @@ async function loadSession(sid){
     _rearmActiveSessionStream();
     return;
   }
+  // #2980: if this (current) load resolved a hidden pre-compression snapshot,
+  // follow the backend's continuation hint to the visible continuation so a
+  // mobile reload mid-compression doesn't strand the user on a hidden snapshot.
+  const continuationSid=(data.session&&data.session.continuation_session_id)||'';
+  if(continuationSid&&continuationSid!==sid&&!opts.skipContinuationResolve){
+    try{localStorage.setItem('hermes-webui-session',continuationSid);}catch(_){}
+    _setActiveSessionUrl(continuationSid);
+    _loadingSessionId=null;
+    return loadSession(continuationSid,{...opts,skipLineageResolve:true,skipContinuationResolve:true,force:true});
+  }
   S.session=data.session;
   // Loading a real existing session abandons any pre-session toolset override
   // staged on the empty composer — clear it so it can't leak into a later New
