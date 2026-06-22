@@ -3,6 +3,12 @@
 
 ## [Unreleased]
 
+## [v0.51.592] — 2026-06-22 — Release UY (skip gateway poll when hidden/streaming + smd re-init)
+
+### Fixed
+
+- **The sidebar's gateway-poll fallback no longer burns CPU re-rendering while you're streaming or the tab is hidden, and long streamed responses render more efficiently.** The 5s gateway-poll fallback now skips its `renderSessionList` pass when the tab is hidden or a turn is actively streaming (it catches up immediately on tab refocus via a one-time `visibilitychange` listener, so no gateway updates are dropped). Separately, when the streaming markdown parser was torn down by a prior segment but `window.smd` is still available, the live renderer now recreates the parser on the cleared element instead of falling back to repeated full-`innerHTML` rebuilds — avoiding O(n²) DOM churn on long responses. Thanks @akrhin. (#4730)
+
 ## [v0.51.591] — 2026-06-22 — Release UX (stop transcript jumping to first message on completion)
 
 ### Fixed

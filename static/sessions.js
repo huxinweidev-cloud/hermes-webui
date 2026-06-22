@@ -4101,7 +4101,23 @@ if(typeof window!=='undefined') window.refreshSessionList = refreshSessionList;
 function startGatewayPollFallback(ms){
   const intervalMs = Math.max(5000, Number(ms) || _gatewayFallbackPollMs);
   if(_gatewayPollTimer) clearInterval(_gatewayPollTimer);
-  _gatewayPollTimer = setInterval(() => { renderSessionList({deferWhileInteracting:true}); }, intervalMs);
+  _gatewayPollTimer = setInterval(() => {
+    // Skip poll when tab is hidden or a stream is active — saves CPU
+    // and avoids redundant DOM renders during active streaming (#4704).
+    if(typeof document !== 'undefined' && document.hidden) return;
+    if(typeof S !== 'undefined' && (S.busy || S.activeStreamId)) return;
+    renderSessionList({deferWhileInteracting:true});
+  }, intervalMs);
+  // Visibility catch-up: refresh immediately when tab re-gains focus,
+  // so no gateway updates are dropped during hidden-skip periods.
+  if(typeof document !== 'undefined' && !document._hermesGatewayPollVisibilityHook){
+    document.addEventListener('visibilitychange', () => {
+      if(!document.hidden && typeof renderSessionList === 'function'){
+        void renderSessionList({deferWhileInteracting:false});
+      }
+    });
+    document._hermesGatewayPollVisibilityHook = true;
+  }
 }
 
 function stopGatewayPollFallback(){
