@@ -453,6 +453,13 @@ def _all_profiles_enabled(parsed_url) -> bool:
     return _all_profiles_query_flag(parsed_url) and not _is_isolated_profile_mode()
 
 
+def _query_flag(parsed_url, name: str) -> bool:
+    """Return True for a truthy query flag value."""
+    qs = parse_qs(parsed_url.query)
+    raw = qs.get(name, [''])[0].strip().lower()
+    return raw in ('1', 'true', 'yes', 'on')
+
+
 def _session_visible_to_active_profile(session_profile, handler=None) -> bool:
     """Return whether a detail-load session belongs to the active profile.
 
@@ -1589,6 +1596,7 @@ def _session_list_cache_key(
     show_cli_sessions: bool,
     show_previous_messaging_sessions: bool,
     show_cron_sessions: bool,
+    include_archived: bool = False,
     source_filter: str | None = None,
 ) -> tuple:
     return (
@@ -1597,6 +1605,7 @@ def _session_list_cache_key(
         bool(show_cli_sessions),
         bool(show_previous_messaging_sessions),
         bool(show_cron_sessions),
+        bool(include_archived),
         source_filter,
     )
 
@@ -1806,17 +1815,32 @@ def _build_session_list_cache_payload(
     show_cli_sessions: bool,
     show_previous_messaging_sessions: bool,
     show_cron_sessions: bool,
+    include_archived: bool = False,
     source_filter: str | None = None,
     diag=None,
 ) -> dict:
     diag_stage = diag.stage if diag is not None else lambda *_a, **_k: None
 
+    def _all_sessions_for_sidebar():
+        try:
+            return all_sessions(diag=diag, include_lineage_metadata=False)
+        except TypeError as exc:
+            message = str(exc)
+            if (
+                "unexpected keyword argument" not in message
+                or "include_lineage_metadata" not in message
+            ):
+                raise
+            # Focused tests and third-party callers sometimes monkeypatch
+            # routes.all_sessions with the historical diag-only signature.
+            return all_sessions(diag=diag)
+
     diag_stage("all_sessions")
-    webui_sessions = all_sessions(diag=diag)
+    webui_sessions = _all_sessions_for_sidebar()
     diag_stage("reconcile_stale_stream_state")
     if _reconcile_stale_stream_state_for_session_rows(webui_sessions):
         diag_stage("all_sessions_after_stale_stream_reconcile")
-        webui_sessions = all_sessions(diag=diag)
+        webui_sessions = _all_sessions_for_sidebar()
     diag_stage("normalize_cli_rows")
     show_cli_sessions = bool(show_cli_sessions)
     show_previous_messaging_sessions = bool(show_previous_messaging_sessions)
@@ -1827,12 +1851,12 @@ def _build_session_list_cache_payload(
         cli = get_cli_sessions(source_filter=source_filter, all_profiles=all_profiles)
         diag_stage("merge_cli_sessions")
         cli_by_id = {s["session_id"]: s for s in cli}
-        # #3238: reconcile orphaned imported-CLI sidecars. When a CLI
-        # session was clicked in WebUI it gets a WebUI-owned sidecar that
-        # all_sessions() returns independently of state.db. If the user
-        # later deletes the backing CLI session from the command line,
-        # the sidecar is never pruned and the stale row lingers in the
-        # sidebar forever (there is no WebUI delete affordance for it).
+        # #3238/#4591: reconcile orphaned imported sidecars. When a CLI or
+        # API-server session is clicked in WebUI it gets a WebUI-owned sidecar
+        # that all_sessions() returns independently of state.db. If the user
+        # later deletes the backing agent session outside WebUI, the sidecar is
+        # never pruned and the stale row lingers in the sidebar forever (there
+        # is no WebUI delete affordance for read-only imported rows).
         # Drop rows whose backing agent row is genuinely gone. We probe
         # state.db directly (agent_session_rows_existing) rather than trust
         # cli_by_id absence, because get_cli_sessions() caps at
@@ -1846,7 +1870,7 @@ def _build_session_list_cache_payload(
             _sid = s.get("session_id")
             if (
                 _sid
-                and is_cli_session_row(s)
+                and (is_cli_session_row(s) or _is_api_server_sidecar_row(s))
                 and not _session_source_is_webui(s)
                 and _sid not in cli_by_id
             ):
@@ -1879,11 +1903,11 @@ def _build_session_list_cache_payload(
                         prune_session_from_index(_sid)
                     except Exception:
                         logger.debug(
-                            "Failed to prune orphaned CLI sidecar %s",
+                            "Failed to prune orphaned agent sidecar %s",
                             _sid,
                             exc_info=True,
                         )
-                    diag_stage("prune_orphaned_cli_sidecar")
+                    diag_stage("prune_orphaned_agent_sidecar")
                     continue
                 _kept_after_orphan_prune.append(s)
         webui_sessions = _kept_after_orphan_prune
@@ -1943,19 +1967,42 @@ def _build_session_list_cache_payload(
         scoped = [s for s in merged if _profiles_match(s.get("profile"), active_profile)]
         other_profile_count = 0 if _is_isolated_profile_mode() else len(merged) - len(scoped)
     diag_stage("messaging_dedupe")
-    scoped = _keep_latest_messaging_session_per_source(
-        scoped,
+    archived_scoped = _keep_latest_messaging_session_per_source(
+        list(scoped),
+        show_previous_messaging_sessions=show_previous_messaging_sessions,
+    )
+    visible_scoped = _keep_latest_messaging_session_per_source(
+        [s for s in scoped if not s.get("archived")],
         show_previous_messaging_sessions=show_previous_messaging_sessions,
     )
     if show_cli_sessions:
         diag_stage("cli_cap")
-        scoped = _cap_recent_cli_sessions(scoped, cli_cap=CLI_VISIBLE_SESSION_CAP)
+        archived_scoped = _cap_recent_cli_sessions(archived_scoped, cli_cap=CLI_VISIBLE_SESSION_CAP)
+        visible_scoped = _cap_recent_cli_sessions(visible_scoped, cli_cap=CLI_VISIBLE_SESSION_CAP)
+    archived_webui_count = sum(
+        1 for s in archived_scoped
+        if s.get("archived") and not _is_cli_session_for_settings(s)
+    )
+    archived_cli_count = sum(
+        1 for s in archived_scoped
+        if s.get("archived") and _is_cli_session_for_settings(s)
+    )
+    archived_count = archived_webui_count + archived_cli_count
+    scoped = archived_scoped if include_archived else visible_scoped
+    if not include_archived:
+        diag_stage("filter_archived_sessions")
+    diag_stage("visible_lineage_metadata")
+    _enrich_sidebar_lineage_metadata(scoped)
     return {
         "sessions": [
             dict(s) if isinstance(s, dict) else {}
             for s in scoped
         ],
         "cli_count": len(deduped_cli),
+        "archived_count": archived_count,
+        "archived_webui_count": archived_webui_count,
+        "archived_cli_count": archived_cli_count,
+        "include_archived": include_archived,
         "all_profiles": all_profiles,
         "active_profile": active_profile,
         "other_profile_count": other_profile_count,
@@ -1976,6 +2023,10 @@ def _session_list_payload_to_response(payload: dict) -> dict:
     return {
         "sessions": safe_merged,
         "cli_count": int(payload.get("cli_count", 0)),
+        "archived_count": int(payload.get("archived_count", 0)),
+        "archived_webui_count": int(payload.get("archived_webui_count", 0)),
+        "archived_cli_count": int(payload.get("archived_cli_count", 0)),
+        "include_archived": bool(payload.get("include_archived", False)),
         "all_profiles": bool(payload.get("all_profiles", False)),
         "active_profile": payload.get("active_profile"),
         "other_profile_count": int(payload.get("other_profile_count", 0)),
@@ -5364,6 +5415,10 @@ def _resolve_cli_import_metadata(session_id: str, *, requested_profile=None, all
 
 
 def _messaging_session_identity(session: dict, raw_source: str) -> str:
+    sid = _safe_first(session.get("session_id"))
+    if sid and _is_pre_compression_continuation_row(session):
+        return f"{raw_source}|session_id:{sid}"
+
     metadata = _lookup_gateway_session_identity(session.get("session_id"))
     session_key = _safe_first(
         metadata.get("session_key"),
@@ -5398,7 +5453,27 @@ def _messaging_session_identity(session: dict, raw_source: str) -> str:
 
     if identity_parts:
         return f"{raw_source}|" + "|".join(identity_parts)
+
     return raw_source
+
+
+def _is_pre_compression_snapshot_id(session_id: str) -> bool:
+    sid = _safe_first(session_id)
+    if not sid or not all(c in "0123456789abcdefghijklmnopqrstuvwxyz_" for c in sid):
+        return False
+    try:
+        path = SESSION_DIR / f"{sid}.json"
+        if not path.exists():
+            return False
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return bool(data.get("pre_compression_snapshot"))
+    except Exception:
+        return False
+
+
+def _is_pre_compression_continuation_row(session: dict) -> bool:
+    parent_sid = _safe_first(session.get("parent_session_id"))
+    return bool(parent_sid and _is_pre_compression_snapshot_id(parent_sid))
 
 
 def _session_messaging_raw_source(session: dict) -> str:
@@ -5462,9 +5537,14 @@ def _should_hide_stale_messaging_session(
         return True
 
     if not _has_durable_messaging_identity(session):
+        if _is_pre_compression_continuation_row(session):
+            return False
+        parent_sid = _safe_first(session.get("parent_session_id"))
+        if parent_sid and parent_sid in active_gateway_session_ids:
+            return True
         return True
 
-    if session.get("parent_session_id"):
+    if session.get("parent_session_id") and not _is_pre_compression_continuation_row(session):
         return True
 
     message_count = _numeric_count(session.get("message_count"))
@@ -6066,6 +6146,24 @@ def _session_source_is_webui(session: dict) -> bool:
     return False
 
 
+def _normalized_source_marker(value) -> str:
+    marker = str(value or "").strip().lower()
+    if marker.endswith(" session"):
+        marker = marker[:-len(" session")].strip()
+    return marker.replace("-", "_").replace(" ", "_")
+
+
+def _is_api_server_sidecar_row(session: dict) -> bool:
+    """Return True for API-server imported sidecars that need orphan pruning."""
+    if not isinstance(session, dict) or _session_source_is_webui(session):
+        return False
+    markers = {
+        _normalized_source_marker(session.get(key))
+        for key in ("source", "source_tag", "raw_source", "session_source", "source_label")
+    }
+    return bool(markers & {"api", "api_server"})
+
+
 def _session_lineage_ids(session: dict) -> set[str]:
     """Return known ids that identify one logical sidebar lineage."""
     if not isinstance(session, dict):
@@ -6273,6 +6371,7 @@ from api.models import (
     get_state_db_session_messages,
     get_state_db_session_summary,
     merge_session_messages_append_only,
+    _enrich_sidebar_lineage_metadata,
     _active_stream_ids,
     _session_message_merge_key,
     _session_message_visible_key,
@@ -6284,6 +6383,105 @@ from api.models import (
     is_cron_session,
     is_safe_session_id,
 )
+
+
+def _pre_compression_continuation_session_id(session) -> str | None:
+    """Return the newest visible descendant for a hidden compression snapshot.
+
+    Mobile browsers can miss the final SSE `done` handoff while backgrounded.
+    On reload they may request the archived pre-compression session id from the
+    stale URL/localStorage. The old snapshot is intentionally hidden from the
+    sidebar, so expose a lightweight recovery hint when a child continuation
+    exists either in memory or on disk. Follow bounded snapshot-to-snapshot hops
+    so repeated compression still lands on the latest visible continuation.
+    """
+    if not getattr(session, "pre_compression_snapshot", False):
+        return None
+    sid = _safe_first(getattr(session, "session_id", None))
+    if not sid:
+        return None
+    # #2980 hardening: the resolved continuation is written to the client's
+    # URL/localStorage, so it must stay within the requested snapshot's own
+    # profile. Children are matched only by parent_session_id below; a
+    # crafted/corrupt foreign-profile sidecar whose parent_session_id collided
+    # with this snapshot's id would otherwise leak cross-profile. Pin the
+    # snapshot's profile and reject any child that isn't profile-matched.
+    snapshot_profile = getattr(session, "profile", None)
+
+    def _child_rows() -> list:
+        rows = []
+        seen_ids = set()
+        try:
+            with LOCK:
+                memory_sessions = list(SESSIONS.values())
+            for child in memory_sessions:
+                child_sid = _safe_first(getattr(child, "session_id", None))
+                if not child_sid or child_sid in seen_ids:
+                    continue
+                seen_ids.add(child_sid)
+                rows.append(child)
+        except Exception:
+            pass
+        try:
+            for path in SESSION_DIR.glob("*.json"):
+                if path.name.startswith("_"):
+                    continue
+                child_sid = path.stem
+                if not child_sid or child_sid in seen_ids:
+                    continue
+                child = Session.load_metadata_only(child_sid)
+                if child:
+                    seen_ids.add(child_sid)
+                    rows.append(child)
+        except Exception:
+            pass
+        return rows
+
+    children_by_parent: dict[str, list] = {}
+    for child in _child_rows():
+        parent_sid = _safe_first(getattr(child, "parent_session_id", None))
+        child_sid = _safe_first(getattr(child, "session_id", None))
+        if not parent_sid or not child_sid or child_sid == sid:
+            continue
+        # Cross-profile guard: only follow continuations within the snapshot's profile.
+        if not _profiles_match(getattr(child, "profile", None), snapshot_profile):
+            continue
+        children_by_parent.setdefault(parent_sid, []).append(child)
+
+    candidates = []
+    frontier = [sid]
+    seen = {sid}
+    for _ in range(20):
+        if not frontier:
+            break
+        parent_sid = frontier.pop(0)
+        for child in children_by_parent.get(parent_sid, []):
+            child_sid = _safe_first(getattr(child, "session_id", None))
+            if not child_sid or child_sid in seen:
+                continue
+            seen.add(child_sid)
+            if getattr(child, "pre_compression_snapshot", False):
+                frontier.append(child_sid)
+            else:
+                candidates.append(child)
+
+    if not candidates:
+        return None
+    latest = max(
+        candidates,
+        key=lambda child: float(
+            _safe_first(
+                getattr(child, "updated_at", None),
+                getattr(child, "created_at", None),
+                0,
+            ) or 0
+        ),
+    )
+    latest_sid = getattr(latest, "session_id", None) or None
+    # Only hand the client a well-formed session id (it gets written to URL/localStorage).
+    if latest_sid and not is_safe_session_id(latest_sid):
+        return None
+    return latest_sid
 from api.workspace import (
     load_workspaces,
     save_workspaces,
@@ -9221,6 +9419,11 @@ def handle_get(handler, parsed) -> bool:
                     float(raw.get("updated_at") or 0),
                     _merged_last_message_at,
                 )
+            # #2980: surface the visible continuation for a hidden pre-compression
+            # snapshot so a mobile reload mid-compression can recover to it.
+            continuation_sid = _pre_compression_continuation_session_id(s)
+            if continuation_sid:
+                raw["continuation_session_id"] = continuation_sid
             if cli_meta and _session_source_is_webui(cli_meta):
                 raw = _reconcile_session_detail_source_flags(raw, cli_meta)
             elif cli_meta and _is_messaging_session_record(cli_meta):
@@ -9402,12 +9605,14 @@ def handle_get(handler, parsed) -> bool:
             agent_session_source_filter = settings.get("agent_session_source_filter")
             active_profile = get_active_profile_name()
             all_profiles = _all_profiles_enabled(parsed)
+            include_archived = _query_flag(parsed, "include_archived")
             key = _session_list_cache_key(
                 active_profile=active_profile,
                 all_profiles=all_profiles,
                 show_cli_sessions=show_cli_sessions,
                 show_previous_messaging_sessions=show_previous_messaging_sessions,
                 show_cron_sessions=show_cron_sessions,
+                include_archived=include_archived,
                 source_filter=agent_session_source_filter,
             )
             # Keep the visible /api/sessions contract unchanged even though the
@@ -9422,6 +9627,7 @@ def handle_get(handler, parsed) -> bool:
                     show_cli_sessions=show_cli_sessions,
                     show_previous_messaging_sessions=show_previous_messaging_sessions,
                     show_cron_sessions=show_cron_sessions,
+                    include_archived=include_archived,
                     source_filter=agent_session_source_filter,
                     diag=diag,
                 ),
@@ -10155,6 +10361,20 @@ def handle_post(handler, parsed) -> bool:
         from api.updates import check_for_updates
 
         return j(handler, check_for_updates(force=force, include_agent=include_agent_updates))
+
+    if parsed.path == "/api/extensions/toggle":
+        from api.extensions import ExtensionToggleError, set_extension_user_enabled
+
+        try:
+            return j(
+                handler,
+                set_extension_user_enabled(body.get("id"), body.get("enabled")),
+            )
+        except ExtensionToggleError as exc:
+            return bad(handler, str(exc), status=exc.status)
+        except Exception:
+            logger.exception("extension toggle failed")
+            return bad(handler, "Failed to update extension state", status=500)
 
     if parsed.path == "/api/session/recovery/repair-safe":
         from api.session_recovery import repair_safe_session_recovery
@@ -13444,6 +13664,7 @@ def _handle_tts(handler, parsed):
         "fr-CA-AntoineNeural", "fr-CA-JeanNeural",
         "fr-CA-SylvieNeural", "fr-CA-ThierryNeural",
         "fr-FR-DeniseNeural", "fr-FR-EloiseNeural", "fr-FR-HenriNeural",
+        "id-ID-GadisNeural",
     }
     if voice not in allowed:
         from api.helpers import bad as _bad

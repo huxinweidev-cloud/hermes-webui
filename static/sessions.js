@@ -1103,6 +1103,17 @@ async function loadSession(sid){
     _rearmActiveSessionStream();
     return;
   }
+  // #2980: if this (current) load resolved a hidden pre-compression snapshot,
+  // follow the backend's continuation hint to the visible continuation so a
+  // mobile reload mid-compression doesn't strand the user on a hidden snapshot.
+  // Do NOT write URL/localStorage here — let the re-entrant loadSession update
+  // them only once the continuation actually loads, so a rejected/deleted/
+  // cross-profile continuation can't poison restore state with an unusable id.
+  const continuationSid=(data.session&&data.session.continuation_session_id)||'';
+  if(continuationSid&&continuationSid!==sid&&!opts.skipContinuationResolve){
+    _loadingSessionId=null;
+    return loadSession(continuationSid,{...opts,skipLineageResolve:true,skipContinuationResolve:true,force:true});
+  }
   S.session=data.session;
   // Loading a real existing session abandons any pre-session toolset override
   // staged on the empty composer — clear it so it can't leak into a later New
@@ -2647,6 +2658,8 @@ const NO_PROJECT_FILTER = '__none__';
 let _activeProject = null;  // project_id filter (null = show all, NO_PROJECT_FILTER = unassigned only)
 let _showAllProfiles = false;  // false = filter to active profile only
 let _otherProfileCount = 0;       // count of sessions from other profiles (server-reported)
+let _archivedWebuiCount = 0;      // archived WebUI sessions not fetched until requested
+let _archivedCliCount = 0;        // archived non-WebUI sessions not fetched until requested
 let _sessionSourceFilter = 'webui';  // 'webui' keeps WebUI chats separate from read-only CLI sessions
 _restoreSessionSourceFilter();
 let _sessionActionMenu = null;
@@ -3622,6 +3635,8 @@ function _applySessionListPayload(sessData, projData){
   // active profile so the "Show N from other profiles" toggle can render
   // without a second round-trip. Stashed on the module for renderSessionListFromCache.
   _otherProfileCount = sessData.other_profile_count || 0;
+  _archivedWebuiCount = Number(sessData.archived_webui_count ?? sessData.archived_count ?? 0);
+  _archivedCliCount = Number(sessData.archived_cli_count ?? 0);
   // Capture server clock for clock-skew compensation (issue #1144).
   // server_time is epoch seconds from the server's time.time().
   // _serverTimeDelta = client - server, so (Date.now() - _serverTimeDelta)
@@ -3696,7 +3711,10 @@ async function _runRenderSessionListRefresh(opts, _gen){
   if(!deferWhileInteracting) _pendingSessionListPayload=null;
   try{
     if(!($('sessionSearch').value||'').trim()) _contentSearchResults = [];
-    const allProfilesQS = _showAllProfiles ? '?all_profiles=1' : '';
+    const qs = new URLSearchParams();
+    if(_showAllProfiles) qs.set('all_profiles','1');
+    if(_showArchived) qs.set('include_archived','1');
+    const sessionListQS = qs.toString() ? `?${qs.toString()}` : '';
     const sessionRequestOpts={
       timeoutToast:false,
       timeoutMs:_sessionListHasLoadedOnce?30000:_SESSION_LIST_BOOT_TIMEOUT_MS,
@@ -3705,11 +3723,12 @@ async function _runRenderSessionListRefresh(opts, _gen){
       retryStatuses:[502,503,504],
     };
     const sessData = _sessionListHasLoadedOnce
-      ? await api('/api/sessions' + allProfilesQS,{timeoutToast:false})
-      : await api('/api/sessions' + allProfilesQS,sessionRequestOpts);
+      ? await api('/api/sessions' + sessionListQS,{timeoutToast:false})
+      : await api('/api/sessions' + sessionListQS,sessionRequestOpts);
     let projData={projects:_allProjects||[]};
     try{
-      projData = await api('/api/projects' + allProfilesQS,{timeoutToast:false});
+      const projectQS = _showAllProfiles ? '?all_profiles=1' : '';
+      projData = await api('/api/projects' + projectQS,{timeoutToast:false});
     }catch(projectError){
       console.warn('renderProjectsList',projectError);
     }
@@ -5248,11 +5267,12 @@ function _partitionSidebarSessionRows(allMatched, activeSidForSidebar){
     _sessionSourceFilter='webui';
   }
   const showCliOnly=_sessionSourceFilter==='cli';
+  const serverArchivedCount=showCliOnly?_archivedCliCount:_archivedWebuiCount;
   return {
     cliSessionCount,
     profileFiltered: showCliOnly ? cliProfileFiltered : webuiProfileFiltered,
     sessionsRaw: showCliOnly ? cliSessionsRaw : webuiSessionsRaw,
-    archivedCount: showCliOnly ? cliArchivedCount : webuiArchivedCount,
+    archivedCount: Math.max(showCliOnly ? cliArchivedCount : webuiArchivedCount, Number(serverArchivedCount||0)),
     webuiReferenceRaw,
     cliReferenceRaw,
     webuiSessionsRaw,
@@ -5487,12 +5507,13 @@ function renderSessionListFromCache(){
     pfToggle.onclick=()=>{_showAllProfiles=false;renderSessionList();};
     list.appendChild(pfToggle);
   }
-  // Show/hide archived toggle if there are archived sessions
-  if(archivedCount>0){
+  // Show/hide archived toggle if there are archived sessions. Archived rows
+  // are fetched on demand so large histories do not bloat every sidebar poll.
+  if(archivedCount>0||_showArchived){
     const toggle=document.createElement('div');
     toggle.style.cssText='font-size:10px;padding:4px 10px;color:var(--muted);cursor:pointer;text-align:center;opacity:.7;';
     toggle.textContent=_showArchived?'Hide archived':'Show '+archivedCount+' archived';
-    toggle.onclick=()=>{_showArchived=!_showArchived;renderSessionListFromCache();};
+    toggle.onclick=()=>{_showArchived=!_showArchived;renderSessionList();};
     list.appendChild(toggle);
   }
   // Empty state for active project filter

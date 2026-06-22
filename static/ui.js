@@ -297,8 +297,36 @@ function _stripWorkspaceDisplayPrefix(text){
 }
 function _renderUserFencedBlocks(text){
   const stash=[];
+  const contextStash=[];
   const mathStash=[];
   const stashMath=(type,src)=>{mathStash.push({type,src});return '\x00UM'+(mathStash.length-1)+'\x00';};
+  const sentContextHtml=(label,quoteText)=>{
+    const safeLabel=String(label||'').trim()||'Context';
+    const safeQuote=String(quoteText||'').replace(/\s+$/,'');
+    return `<figure class="sent-selection-context" data-selected-context="1"><figcaption class="sent-selection-context-label">${esc(safeLabel)}</figcaption><blockquote class="sent-selection-context-quote">${esc(safeQuote)}</blockquote></figure>`;
+  };
+  const stashContext=(label,quote)=>{contextStash.push(sentContextHtml(label,quote));return '\x00UC'+(contextStash.length-1)+'\x00';};
+  const stashSelectedContextBlocks=(value)=>{
+    const lines=String(value||'').split('\n');
+    const marker='<!-- hermes-selected-context -->';
+    const out=[];
+    for(let i=0;i<lines.length;i++){
+      const labelMatch=lines[i].match(/^\*\*([^\n]{1,200}):\*\*\s*$/);
+      if(!labelMatch){out.push(lines[i]);continue;}
+      const quoteLines=[];
+      let j=i+1;
+      if(lines[j]!==marker){out.push(lines[i]);continue;}
+      j++;
+      while(j<lines.length&&/^>/.test(lines[j])){
+        quoteLines.push(lines[j].replace(/^>[ \t]?/,''));
+        j++;
+      }
+      if(!quoteLines.length){out.push(lines[i]);continue;}
+      out.push(stashContext(labelMatch[1], quoteLines.join('\n')));
+      i=j-1;
+    }
+    return out.join('\n');
+  };
   const restoreMath=html=>String(html||'').replace(/\x00UM(\d+)\x00/g,(_,i)=>{
     const item=mathStash[+i];
     if(!item) return '';
@@ -340,10 +368,15 @@ function _renderUserFencedBlocks(text){
   s=s.replace(/\\\[([\s\S]+?)\\\]/g,(_,m)=>stashMath('display',m));
   s=s.replace(/\$([^\s$\n][^$\n]*?[^\s$\n]|\S)\$/g,(_,m)=>stashMath('inline',m));
   s=s.replace(/\\\((.+?)\\\)/g,(_,m)=>stashMath('inline',m));
+  // Render selected-context payloads produced by Reply with selection as calm
+  // quote cards in the sent user bubble. Keep ordinary user Markdown escaped;
+  // only blocks carrying the internal marker get custom treatment.
+  s=stashSelectedContextBlocks(s);
   // Escape remaining plain text and convert newlines to <br>
   s=esc(s).replace(/\n/g,'<br>');
-  // Restore stashed code blocks, then math placeholders as KaTeX targets.
+  // Restore stashed code/context blocks, then math placeholders as KaTeX targets.
   s=s.replace(/\x00UF(\d+)\x00/g,(_,i)=>stash[+i]);
+  s=s.replace(/\x00UC(\d+)\x00/g,(_,i)=>contextStash[+i]||'');
   s=restoreMath(s);
   return s;
 }
@@ -745,6 +778,34 @@ function _restoreMessageViewportAnchor(anchor, rawIdxDelta){
   container.scrollTop+=(rect.top-containerRect.top)-targetTop;
   requestAnimationFrame(()=>{ _programmaticScroll=false; });
   return true;
+}
+let _messageViewportAnchorRemounting=false;
+function _remountMessageViewportAnchor(anchor){
+  const container=$('messages');
+  if(!container||!anchor||_messageViewportAnchorRemounting) return false;
+  const targetIdx=Number(anchor.rawIdx);
+  if(!Number.isFinite(targetIdx)) return false;
+  if(container.querySelector(`[data-msg-idx="${targetIdx}"]`)) return true;
+  if(typeof _getVisibleMessagesWithIdx!=='function'||
+     typeof _messageVisibleIndexForRawIdx!=='function'||
+     typeof _messageVirtualScrollTopForVisibleIdx!=='function'||
+     typeof renderMessages!=='function') return false;
+  const visWithIdx=_getVisibleMessagesWithIdx();
+  const visIdx=_messageVisibleIndexForRawIdx(targetIdx,visWithIdx);
+  if(visIdx<0) return false;
+  // A virtualized anchor may be outside the current DOM. Scroll to its virtual
+  // row and render once so the semantic restore below has a real target.
+  _programmaticScroll=true;
+  container.scrollTop=_messageVirtualScrollTopForVisibleIdx(visWithIdx,visIdx,container);
+  _messageVirtualWindowKey='';
+  _messageViewportAnchorRemounting=true;
+  try{
+    renderMessages({preserveScroll:true});
+  }finally{
+    _messageViewportAnchorRemounting=false;
+    requestAnimationFrame(()=>{ setTimeout(()=>{ _programmaticScroll=false; },0); });
+  }
+  return !!container.querySelector(`[data-msg-idx="${targetIdx}"]`);
 }
 function _compensateScrollForMeasurementDelta(renderFn){
   const container=$('messages');
@@ -3008,13 +3069,61 @@ function _applyReasoningChip(eff){
   _highlightReasoningOption(effort);
 }
 
+// Tracks the model/provider identity of the last reasoning fetch so routine
+// topbar syncs can serve the cached chip state instead of re-hitting the
+// network. null = never fetched.
+let _lastReasoningFetchKey=null;
+// Monotonic dispatch counter. Each fetchReasoningChip() increments it and the
+// async handlers capture their own value; a response (success OR failure) only
+// applies if it is still the most recent dispatch. This defeats out-of-order
+// resolution even when two fetches share the same model/provider key (e.g. a
+// profile switch that resets the cache and refetches the same default model but
+// a different agent.reasoning_effort) — #4650 review.
+let _reasoningFetchSeq=0;
+
 function fetchReasoningChip(){
-  api('/api/reasoning'+_reasoningEffortQuery()).then(function(st){
+  // Set the cache key OPTIMISTICALLY before the request so rapid routine syncs
+  // while this GET is in flight short-circuit instead of re-dispatching (that
+  // in-flight window is exactly where the #4650 storm lived).
+  const key=_reasoningEffortQuery();
+  const seq=++_reasoningFetchSeq;
+  _lastReasoningFetchKey=key;
+  api('/api/reasoning'+key).then(function(st){
+    // Ignore a stale/superseded response: only the most recent dispatch may
+    // apply, so an older in-flight GET can't poison the current chip (#4650).
+    if(seq!==_reasoningFetchSeq) return;
     _applyReasoningChip((st&&st.reasoning_effort)||'', st||{});
-  }).catch(function(){_applyReasoningChip('', {supported_efforts:[]});});
+  }).catch(function(){
+    // Same staleness guard on failure: a stale error must neither hide the chip
+    // nor clear a newer fetch's key. Only the latest dispatch clears the key so
+    // routine syncs retry after a genuine transient failure.
+    if(seq!==_reasoningFetchSeq) return;
+    _lastReasoningFetchKey=null;
+    _applyReasoningChip('', {supported_efforts:[]});
+  });
 }
 
 function syncReasoningChip(){
+  // #4650: syncTopbar() calls this on every routine UI refresh, and during
+  // streaming those fire at high frequency. Before a9ce2889 this served the
+  // cached _currentReasoningEffort after the first load; that commit made it
+  // refetch unconditionally to refresh supported-efforts after a model switch,
+  // which turned ordinary syncs into a GET /api/reasoning storm (one per token).
+  // Restore the cache short-circuit but keep a9ce2889's intent: only hit the
+  // network when nothing is cached yet OR the model/provider identity changed
+  // since the last fetch (the only inputs that change /api/reasoning's answer).
+  // The user-pick and model-switch paths still update the cache directly.
+  const key=_reasoningEffortQuery();
+  // Short-circuit on the KEY alone: if a fetch for this exact model/provider has
+  // already been dispatched (in-flight) or completed, do not dispatch another —
+  // this is what stops the #4650 storm, including the COLD-cache window where
+  // _currentReasoningEffort is still null between the first dispatch and its
+  // response (10 syncs before the first GET resolves must produce ONE request,
+  // not ten). Apply the cached chip only once we actually have an effort value.
+  if(_lastReasoningFetchKey===key){
+    if(_currentReasoningEffort!==null) _applyReasoningChip(_currentReasoningEffort);
+    return;
+  }
   fetchReasoningChip();
 }
 
@@ -4049,6 +4158,12 @@ function _syncCtxIndicator(usage){
   const wrap=$('ctxIndicatorWrap');
   const el=$('ctxIndicator');
   if(!el)return;
+  const ctxHidden=!!(window._composerControlVisibility&&window._composerControlVisibility.hide_composer_context);
+  if(ctxHidden){
+    if(wrap) wrap.style.display='none';
+    _syncMobileCtxDisplay({visible:false});
+    return;
+  }
   // #1436: Use last_prompt_tokens only — NEVER fall back to cumulative
   // input_tokens for the "context window % used" calculation.  input_tokens
   // is summed across all turns, so dividing it by the context window gives a
@@ -4069,7 +4184,12 @@ function _syncCtxIndicator(usage){
     _syncMobileCtxDisplay({visible:false});
     return;
   }
-  if(wrap) wrap.style.display='';
+  if(wrap){
+    // Defensive reset: keep dynamic context display from being stuck hidden.
+    wrap.classList.remove('composer-control-hidden');
+    wrap.removeAttribute('aria-hidden');
+    wrap.style.display='';
+  }
   const hasPromptTok=!!promptTok;
   const rawPct=hasPromptTok?Math.round((promptTok/ctxWindow)*100):0;
   const pct=Math.min(100,rawPct);
@@ -5223,11 +5343,20 @@ function setStatus(t){
 function setComposerStatus(t){
   const el=$('composerStatus');
   if(!el)return;
+  const statusHidden=!!(window._composerControlVisibility&&window._composerControlVisibility.hide_composer_status);
+  if(statusHidden){
+    el.style.display='none';
+    el.textContent='';
+    return;
+  }
   if(!t){
     el.style.display='none';
     el.textContent='';
     return;
   }
+  // Defensive reset: a stale hidden class should never block live status text.
+  el.classList.remove('composer-control-hidden');
+  el.removeAttribute('aria-hidden');
   el.textContent=t;
   el.style.display='';
 }
@@ -5273,7 +5402,7 @@ function unlockComposerForClarify(){
 
 function _composerHasContent(){
   const msg=$('msg');
-  return !!((msg&&msg.value.trim().length>0)||S.pendingFiles.length>0);
+  return !!((msg&&msg.value.trim().length>0)||S.pendingFiles.length>0||(typeof window._hasPendingSelections==='function'&&window._hasPendingSelections()));
 }
 
 function _getExplicitBusyCommandAction(text){
@@ -5857,7 +5986,10 @@ function showConfirmDialog(opts={}){
   if(title) title.textContent=opts.title||t('dialog_confirm_title');
   if(desc) desc.textContent=opts.message||'';
   if(input){input.style.display='none';input.value='';}
-  if(cancelBtn) cancelBtn.textContent=opts.cancelLabel||t('cancel');
+  if(cancelBtn){
+    if(opts.hideCancel){cancelBtn.style.display='none';}
+    else{cancelBtn.style.display='';cancelBtn.textContent=opts.cancelLabel||t('cancel');}
+  }
   if(confirmBtn){
     confirmBtn.textContent=opts.confirmLabel||t('dialog_confirm_btn');
     confirmBtn.classList.toggle('danger',!!opts.danger);
@@ -5887,7 +6019,13 @@ function showPromptDialog(opts={}){
     input.value=prefill;input.placeholder=opts.placeholder||'';
     input.autocomplete='off';input.spellcheck=false;
   }
-  if(cancelBtn) cancelBtn.textContent=opts.cancelLabel||t('cancel');
+  if(cancelBtn){
+    // A prior showConfirmDialog({hideCancel:true}) (e.g. the outside-symlink info
+    // dialog, #4581) may have hidden the shared Cancel button; always restore it
+    // so a subsequent prompt keeps its Cancel affordance.
+    cancelBtn.style.display='';
+    cancelBtn.textContent=opts.cancelLabel||t('cancel');
+  }
   if(confirmBtn){
     confirmBtn.textContent=opts.confirmLabel||t('create');
     confirmBtn.classList.toggle('danger',!!opts.danger);
@@ -6067,6 +6205,8 @@ function _buildBrowserUtterance(text, btn){
 }
 
 function _playEdgeTtsChunked(text, btn){
+  _ttsSpeaking=true;
+  if(btn) btn.dataset.speaking='1';
   const chunks=_splitForTTS(text);
   const _playOne=function(idx){
     if(idx>=chunks.length){
@@ -7515,6 +7655,8 @@ function syncTopbar(){
     // Update profile chip even when no session is active (e.g. right after profile switch)
     const _profileLabel=$('profileChipLabel');
     if(_profileLabel) _profileLabel.textContent=S.activeProfile||'default';
+    const _titleLabel=$('titlebarProfileLabel');
+    if(_titleLabel) _titleLabel.textContent=S.activeProfile||'default';
     return;
   }
   const sessionTitle=S.session.title||t('untitled');
@@ -7640,6 +7782,8 @@ function syncTopbar(){
   // unaffected by this line.
   const profileLabel=$('profileChipLabel');
   if(profileLabel) profileLabel.textContent=S.activeProfile||'default';
+  const titleLabel=$('titlebarProfileLabel');
+  if(titleLabel) titleLabel.textContent=S.activeProfile||'default';
 }
 
 function msgContent(m){
@@ -8072,6 +8216,31 @@ function _transparentToolStatus(tc, settled){
   if(tc&&tc.done===false) return settled?'Interrupted':'Running';
   return 'Completed';
 }
+// Quiet one-line summary for a collapsed transparent tool row (#4658).
+// The transparent view overrides the row name to the bare tool name
+// (_toolShortName, e.g. "read_file"/"terminal"), so — unlike the worklog view —
+// it has no action-label carrying the target, and buildToolCard's collapsed
+// preview is blanked for the common arg/shell case (the #4411 suppression that
+// assumes the name carries the target). That left transparent rows showing only
+// the bare tool name with no hint of what each call did. Rebuild a summary from
+// the call's TARGET (path/command/query/skill/...) — NOT the raw result JSON —
+// so it stays consistent with the "keep collapsed previews quiet" intent
+// (test_tool_card_preview_summary.py) while restoring "understand the call
+// without expanding it".
+function _transparentToolSummary(tc){
+  if(!tc||typeof tc!=='object') return '';
+  // Explicit progress text (e.g. subagent_progress) wins while still running.
+  const explicit=String(tc.preview||'').trim();
+  if(tc.done===false&&explicit) return _shortToolLabel(explicit,160);
+  // Target-based summary only (path/command/query/skill). Deliberately NO generic
+  // arg-preview fallback: a call with args but no real target (e.g. `terminal`
+  // with only {workdir} or an unknown tool with {mode:"dry-run"}) must yield an
+  // EMPTY collapsed preview rather than dumping a raw arg snippet — that keeps the
+  // collapsed row quiet and consistent with the no-args case (#4658 review).
+  const target=typeof _toolVisibleTargetLabel==='function'?_toolVisibleTargetLabel(tc,{limit:160}):'';
+  if(target) return target;
+  return '';
+}
 function _copyEventToClipboard(row){
   if(!row) return;
   const type=row.getAttribute('data-event-type');
@@ -8333,6 +8502,22 @@ function _decorateTransparentEventRow(row, opts){
       // also prefix the name with "Running:" — that's the same redundancy class
       // V6 removed from the detail body. (Trifecta r2 #4.)
       if(nameEl) nameEl.textContent=_toolShortName(name);
+      // #4658: restore the collapsed-row inline summary. buildToolCard emits a
+      // `.tool-card-preview` span but blanks its text for the common case, and
+      // the bare _toolShortName above drops the target the worklog view carries
+      // in its action-label name. Populate the preview from a quiet,
+      // target-based summary so each collapsed row says what it did without
+      // expanding. Idempotent across re-decoration (status updates re-run this).
+      const previewEl=header.querySelector('.tool-card-preview');
+      if(previewEl){
+        const summary=_transparentToolSummary(tc);
+        if(summary){
+          previewEl.textContent=summary;
+          previewEl.removeAttribute('hidden');
+        }else{
+          previewEl.textContent='';
+        }
+      }
       let statusEl=header.querySelector('.transparent-event-status');
       if(!statusEl){
         statusEl=document.createElement('span');
@@ -10540,24 +10725,39 @@ function _restoreMessageScrollSnapshot(snapshot){
   const el=$('messages');
   if(!el||!snapshot) return;
   const maxTop=Math.max(0,el.scrollHeight-el.clientHeight);
-  const restoredViaAnchor=(snapshot.anchor&&typeof _restoreMessageViewportAnchor==='function')
+  let restoredViaAnchor=(snapshot.anchor&&typeof _restoreMessageViewportAnchor==='function')
     ? _restoreMessageViewportAnchor(snapshot.anchor,0)
     : false;
+  if(!restoredViaAnchor&&typeof _remountMessageViewportAnchor==='function'&&_remountMessageViewportAnchor(snapshot.anchor)){
+    restoredViaAnchor=(typeof _restoreMessageViewportAnchor==='function')
+      ? _restoreMessageViewportAnchor(snapshot.anchor,0)
+      : false;
+  }
   if(!restoredViaAnchor){
     _programmaticScroll=true;
     el.scrollTop=Math.max(0,Math.min(Number(snapshot.top)||0,maxTop));
   }
   // Sync _lastScrollTop after programmatic restore so sticky-unpin does not false-trigger (#1731).
   _lastScrollTop=el.scrollTop;
-  const bottomDistance=el.scrollHeight-el.scrollTop-el.clientHeight;
-  if(bottomDistance>250){
+  if(snapshot.userUnpinned===true){
     _messageUserUnpinned=true;
     _scrollPinned=false;
     _nearBottomCount=0;
-  }else if(bottomDistance<=120){
+  }else if(snapshot.pinned===true){
     _messageUserUnpinned=false;
     _scrollPinned=true;
     _nearBottomCount=2;
+  }else{
+    const bottomDistance=el.scrollHeight-el.scrollTop-el.clientHeight;
+    if(bottomDistance>250){
+      _messageUserUnpinned=true;
+      _scrollPinned=false;
+      _nearBottomCount=0;
+    }else if(bottomDistance<=120){
+      _messageUserUnpinned=false;
+      _scrollPinned=true;
+      _nearBottomCount=2;
+    }
   }
   if(!restoredViaAnchor){
     requestAnimationFrame(()=>{ setTimeout(()=>{_programmaticScroll=false;},0); });
@@ -10569,22 +10769,10 @@ function _restoreMessageScrollSnapshotSameFrame(snapshot){
   let restoredViaAnchor=(snapshot.anchor&&typeof _restoreMessageViewportAnchor==='function')
     ? _restoreMessageViewportAnchor(snapshot.anchor,0)
     : false;
-  if(!restoredViaAnchor&&snapshot.anchor&&snapshot.anchor.rawIdx!=null&&
-     !el.querySelector(`[data-msg-idx="${snapshot.anchor.rawIdx}"]`)&&
-     typeof _getVisibleMessagesWithIdx==='function'&&
-     typeof _messageVisibleIndexForRawIdx==='function'&&
-     typeof _messageVirtualScrollTopForVisibleIdx==='function'){
-    const visWithIdx=_getVisibleMessagesWithIdx();
-    const visIdx=_messageVisibleIndexForRawIdx(snapshot.anchor.rawIdx,visWithIdx);
-    if(visIdx>=0){
-      _programmaticScroll=true;
-      el.scrollTop=_messageVirtualScrollTopForVisibleIdx(visWithIdx,visIdx,el);
-      _messageVirtualWindowKey='';
-      renderMessages({preserveScroll:true});
-      restoredViaAnchor=(typeof _restoreMessageViewportAnchor==='function')
-        ? _restoreMessageViewportAnchor(snapshot.anchor,0)
-        : false;
-    }
+  if(!restoredViaAnchor&&typeof _remountMessageViewportAnchor==='function'&&_remountMessageViewportAnchor(snapshot.anchor)){
+    restoredViaAnchor=(typeof _restoreMessageViewportAnchor==='function')
+      ? _restoreMessageViewportAnchor(snapshot.anchor,0)
+      : false;
   }
   if(!restoredViaAnchor){
     const maxTop=Math.max(0,el.scrollHeight-el.clientHeight);
@@ -14317,9 +14505,13 @@ function _renderTreeItems(container, entries, depth){
     el.ondragend=()=>{el.classList.remove('dragging');_clearWorkspaceMoveDragOver();};
 
     const isLk = item.type === 'symlink';
-    const isDirLike = item.type === 'dir' || (isLk && item.is_dir);
-    const isFileLike = !isDirLike;
+    const isExternalLink = isLk && item.target_outside_workspace;
+    // External symlinks are display-only: not expandable, not openable.
+    // The read gate (safe_resolve_ws) still blocks navigation through them.
+    const isDirLike = !isExternalLink && (item.type === 'dir' || (isLk && item.is_dir));
+    const isFileLike = !isExternalLink && !isDirLike;
     el.dataset.wsIsDir = String(isDirLike);
+    if(isExternalLink){el.removeAttribute('draggable');el.ondragstart=null;}
 
     if(isDirLike){
       // Toggle arrow for directories
@@ -14340,9 +14532,11 @@ function _renderTreeItems(container, entries, depth){
     // Icon
     const iconEl=document.createElement('span');
     iconEl.className='file-icon';
-    iconEl.innerHTML = isDirLike
-      ? (isLk ? li('link', 14) : li('folder', 14))
-      : (isLk ? li('link', 14) : fileIcon(item.name, item.type));
+    iconEl.innerHTML = isExternalLink
+      ? li('external-link', 14)
+      : isDirLike
+        ? (isLk ? li('link', 14) : li('folder', 14))
+        : (isLk ? li('link', 14) : fileIcon(item.name, item.type));
     el.appendChild(iconEl);
 
     // Name
@@ -14374,6 +14568,8 @@ function _renderTreeItems(container, entries, depth){
       if(_nameClickTimer){clearTimeout(_nameClickTimer);_nameClickTimer=null;}
       // For directories, double-click navigates (breadcrumb view)
       if(isDirLike){loadDir(item.path);return;}
+      // External symlinks: show informational dialog, not rename
+      if(isExternalLink){if(typeof el.onclick==='function')el.onclick(e);return;}
       const inp=document.createElement('input');
       inp.className='file-rename-input';inp.value=item.name;
       inp.onclick=(e2)=>e2.stopPropagation();
@@ -14461,6 +14657,21 @@ function _renderTreeItems(container, entries, depth){
           }
           renderFileTree();
         }
+      };
+    }else if(isExternalLink){
+      // Display-only: the link points outside the workspace. We do NOT disclose
+      // the resolved outside path (#4581 hardening) and do NOT call openFile —
+      // the read gate (safe_resolve_ws) blocks navigation through the link.
+      el.onclick=async(e)=>{
+        e.stopPropagation();
+        await showConfirmDialog({
+          title:item.name,
+          message:t('external_link_open_confirm'),
+          confirmLabel:t('dialog_confirm_btn'),
+          danger:false,
+          hideCancel:true,
+          focusCancel:false,
+        });
       };
     }else{
       el.onclick=async()=>openFile(item.path);

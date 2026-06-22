@@ -467,20 +467,55 @@ def reload_config() -> None:
             _delete_models_cache_on_disk()
 
 
+# Memoized parse cache for _load_yaml_config_file, keyed on (resolved path,
+# st_mtime_ns, st_size). yaml.safe_load on an ~800-line / 24KB config.yaml costs
+# ~125ms of pure-Python parsing, and hot read paths (e.g. GET /api/reasoning ->
+# get_reasoning_status) call this on every request. Without a cache, a UI sync
+# storm turns into a YAML-reparse storm (#4650). We cache the RAW parsed dict and
+# re-run _expand_env_vars() on every call: env expansion is cheap, always returns
+# a fresh structure (so callers that read-modify-save the result never corrupt the
+# cache), and keeps ${VAR} references live against the current os.environ. The
+# (mtime_ns, size) key means any on-disk edit (including by _save_yaml_config_file)
+# is picked up on the next read.
+_yaml_file_cache: dict[str, tuple] = {}
+_yaml_file_cache_lock = threading.Lock()
+
+
 def _load_yaml_config_file(config_path: Path) -> dict:
     try:
         import yaml as _yaml
     except ImportError:
         return {}
 
-    if not config_path.exists():
+    try:
+        st = config_path.stat()
+    except OSError:
+        # Missing or unstattable file — preserve the original "no config" contract.
         return {}
+
+    cache_key = str(config_path)
+    stat_key = (st.st_mtime_ns, st.st_size)
+    with _yaml_file_cache_lock:
+        cached = _yaml_file_cache.get(cache_key)
+        if cached is not None and cached[0] == stat_key:
+            expanded = _expand_env_vars(cached[1])
+            return expanded if isinstance(expanded, dict) else {}
+
+    # Cache miss / stale: parse off disk. Done outside the lock so a slow parse
+    # doesn't serialize unrelated paths; a concurrent duplicate parse is harmless.
     try:
         loaded = _yaml.safe_load(config_path.read_text(encoding="utf-8"))
-        return _expand_env_vars(loaded) if isinstance(loaded, dict) else {}
     except Exception:
         logger.debug("Failed to parse yaml config from %s", config_path)
         return {}
+
+    raw = loaded if isinstance(loaded, dict) else {}
+    with _yaml_file_cache_lock:
+        _yaml_file_cache[cache_key] = (stat_key, raw)
+    if not raw:
+        return {}
+    expanded = _expand_env_vars(raw)
+    return expanded if isinstance(expanded, dict) else {}
 
 
 def get_config_for_profile_home(profile_home: "Path | str | None") -> dict:
@@ -564,6 +599,12 @@ def _save_yaml_config_file(config_path: Path, config_data: dict) -> None:
         _yaml.safe_dump(_config_for_yaml_save(config_data), sort_keys=False, allow_unicode=True),
         encoding="utf-8",
     )
+    # Invalidate the memoized parse for this path so the next read re-parses the
+    # bytes we just wrote. mtime_ns+size keying normally catches edits, but a
+    # WebUI save that preserves size with a coarse/unchanged mtime could otherwise
+    # serve a stale dict (#4650 review) — evicting on our own write closes that gap.
+    with _yaml_file_cache_lock:
+        _yaml_file_cache.pop(str(config_path), None)
 
 
 # Initial load
@@ -7143,6 +7184,22 @@ _SETTINGS_DEFAULTS = {
     "chat_activity_display_mode": "compact_worklog",  # compact_worklog | transparent_stream
     "auto_scroll_follow": True,  # follow new output to the bottom while streaming (Codex/Claude-Code-style sticky bottom); the user scrolling up unpins and is respected
     "worklog_details_expanded_default": False,  # opt-in: expand Worklog details by default; default remains folded
+    "hide_composer_attach": False,  # hide attach button in composer footer
+    "hide_composer_saved_prompts": False,  # hide saved prompts button in composer footer
+    "hide_composer_mic": False,  # hide dictation mic button in composer footer
+    "show_titlebar_profile": False,  # show profile switcher in app titlebar (opt-in)
+    "hide_composer_voice_mode": False,  # hide hands-free voice-mode button in composer footer
+    "hide_composer_yolo": False,  # hide YOLO chip in composer footer
+    "hide_composer_profile": False,  # hide profile chip in composer footer
+    "hide_composer_workspace": False,  # hide workspace controls in composer footer/mobile config panel
+    "hide_composer_mobile_config": False,  # hide mobile composer config button
+    "hide_composer_model": False,  # hide model chip in composer footer/mobile config panel
+    "hide_composer_quota_chip": False,  # hide provider quota chip in composer footer
+    "hide_composer_reasoning": False,  # hide reasoning chip in composer footer/mobile config panel
+    "hide_composer_toolsets": False,  # hide toolsets chip in composer footer
+    "hide_composer_status": False,  # hide status text in composer footer
+    "hide_composer_context": False,  # hide context indicator in composer footer/mobile config panel
+    "hide_composer_bg_badge": False,  # hide background-jobs badge in composer footer
     "pinned_sessions_limit": 3,  # maximum active pinned sessions shown in the sidebar
     "inflight_state_max_sessions": 8,  # max active-stream recovery snapshots kept in browser localStorage
     "inflight_state_max_messages": 24,  # max recent messages kept per recovery snapshot
@@ -7370,6 +7427,22 @@ _SETTINGS_BOOL_KEYS = {
     "auto_scroll_follow",
     "worklog_details_expanded_default",
     "auth_disabled_acknowledged",
+    "hide_composer_attach",
+    "hide_composer_saved_prompts",
+    "hide_composer_mic",
+    "show_titlebar_profile",
+    "hide_composer_voice_mode",
+    "hide_composer_yolo",
+    "hide_composer_profile",
+    "hide_composer_workspace",
+    "hide_composer_mobile_config",
+    "hide_composer_model",
+    "hide_composer_quota_chip",
+    "hide_composer_reasoning",
+    "hide_composer_toolsets",
+    "hide_composer_status",
+    "hide_composer_context",
+    "hide_composer_bg_badge",
 }
 # Language codes are validated as short alphanumeric BCP-47-like tags (e.g. 'en', 'zh', 'fr')
 _SETTINGS_LANG_RE = __import__("re").compile(r"^[a-zA-Z]{2,10}(-[a-zA-Z0-9]{2,8})?$")
