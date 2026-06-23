@@ -871,7 +871,8 @@ function _compensateScrollForMeasurementDelta(renderFn){
   if(!container) return renderFn();
   const anchorBefore=_captureMessageViewportAnchor();
   const scrollTopBefore=container.scrollTop;
-  renderFn();
+  container.classList.add('vscroll-measuring');
+  try{ renderFn(); }finally{ container.classList.remove('vscroll-measuring'); }
   if(!anchorBefore) return;
   if(scrollTopBefore<1){
     const spacer=container.querySelector('[data-virtual-spacer="before"]');
@@ -8224,6 +8225,10 @@ function _worklogDetailBaseKey(el){
 function _worklogDetailDisclosureIsOpen(el){
   return !!(el&&el.classList&&el.classList.contains('open'));
 }
+function _worklogDetailScrollableBody(el){
+  if(!el||!el.querySelector) return null;
+  return el.querySelector('.thinking-card-body,.tool-card-detail');
+}
 function _setWorklogDetailDisclosureOpen(el, open){
   if(!el||!el.classList) return;
   el.classList.toggle('open', !!open);
@@ -8252,7 +8257,12 @@ function _captureWorklogDetailDisclosureState(root){
   const counts=Object.create(null);
   root.querySelectorAll(_worklogDetailDisclosureSelector).forEach(el=>{
     const key=_worklogDetailDisclosureKeyForElement(el, counts);
-    if(key) state.set(key, _worklogDetailDisclosureIsOpen(el));
+    if(!key) return;
+    const body=_worklogDetailScrollableBody(el);
+    state.set(key,{
+      open:_worklogDetailDisclosureIsOpen(el),
+      scrollTop:body?Math.max(0,Number(body.scrollTop)||0):0,
+    });
   });
   return state;
 }
@@ -8264,7 +8274,14 @@ function _restoreWorklogDetailDisclosureState(root, state){
   root.querySelectorAll(_worklogDetailDisclosureSelector).forEach(el=>{
     const key=_worklogDetailDisclosureKeyForElement(el, counts);
     if(!key||!state.has(key)) return;
-    _setWorklogDetailDisclosureOpen(el, state.get(key));
+    const saved=state.get(key);
+    const open=(saved&&typeof saved==='object'&&'open' in saved)?saved.open:saved;
+    _setWorklogDetailDisclosureOpen(el, open);
+    const scrollTop=(saved&&typeof saved==='object')?Number(saved.scrollTop):0;
+    if(open&&Number.isFinite(scrollTop)&&scrollTop>0){
+      const body=_worklogDetailScrollableBody(el);
+      if(body) body.scrollTop=Math.min(scrollTop, Math.max(0, body.scrollHeight-body.clientHeight));
+    }
   });
 }
 function _thinkingCardHtml(text, open){
@@ -9577,8 +9594,9 @@ function renderLiveAnchorActivityScene(streamId, scene, opts){
   const liveDisclosureState=typeof _captureWorklogDetailDisclosureState==='function'
     ? _captureWorklogDetailDisclosureState(blocks)
     : null;
+  const scrollSnapshot=_captureMessageScrollSnapshot();
   blocks.querySelectorAll('[data-anchor-scene-owner="1"],[data-anchor-scene-row="1"]').forEach(el=>el.remove());
-  blocks.querySelectorAll('.live-worklog[data-live-worklog-shell="1"],.tool-worklog-group[data-live-tool-call-group="1"],.tool-call-group[data-live-tool-call-group="1"],.tool-card-row[data-live-tid]:not(.transparent-event-row),.agent-activity-thinking[data-live-thinking="1"]').forEach(el=>el.remove());
+  blocks.querySelectorAll('.live-worklog[data-live-worklog-shell="1"],.tool-worklog-group[data-live-tool-call-group="1"],.tool-call-group[data-live-tool-call-group="1"],.tool-card-row[data-live-tid]:not(.transparent-event-row),.agent-activity-thinking[data-live-thinking="1"],.interim-collapse-toggle').forEach(el=>el.remove());
   blocks.querySelectorAll('[data-live-assistant="1"]').forEach(el=>{
     el.classList.add('assistant-segment-worklog-source');
     el.setAttribute('aria-hidden','true');
@@ -9600,6 +9618,7 @@ function renderLiveAnchorActivityScene(streamId, scene, opts){
   if(typeof _startActivityElapsedTimer==='function') _startActivityElapsedTimer(group);
   _dedupeLiveProcessedWorklogAnchors(turn);
   if(typeof _moveLiveRunStatusToTurnEnd==='function') _moveLiveRunStatusToTurnEnd();
+  _restoreMessageScrollSnapshotSameFrame(scrollSnapshot);
   if(typeof scrollIfPinned==='function') scrollIfPinned();
   return true;
 }
