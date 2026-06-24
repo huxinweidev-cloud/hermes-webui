@@ -204,6 +204,40 @@ def test_apply_force_update_fetch_failure_redacts_credentials(tmp_path):
     )
 
 
+def test_apply_force_update_fetch_failure_redacts_query_secrets(tmp_path):
+    """Apply-path diagnostics must redact secret-bearing query params, not just
+    credential-in-URL and GitHub tokens. The apply path now surfaces sanitized
+    non-network stderr, so query secrets like client_secret/private_token/
+    oauth_token/api_key must be redacted before reaching the user."""
+    (tmp_path / '.git').mkdir()
+    secrets = {
+        'client_secret': 'CS_s3cr3t',
+        'private_token': 'PT_s3cr3t',
+        'oauth_token': 'OA_s3cr3t',
+        'api_key': 'AK_s3cr3t',
+    }
+    remote = (
+        'https://gitlab.example.com/group/repo.git/?'
+        + '&'.join(f'{k}={v}' for k, v in secrets.items())
+    )
+
+    def fake_git(args, cwd, timeout=10):
+        if args == ['fetch', 'origin', '--quiet', '--tags', '--force']:
+            return (f"fatal: repository not found at {remote}"), False
+        raise AssertionError(f'unexpected git args: {args!r}')
+
+    with patch.object(updates, '_run_git', side_effect=fake_git), \
+         patch.object(updates, 'REPO_ROOT', tmp_path), \
+         patch.object(updates, '_restart_blocker_snapshot', return_value={'restart_blocked': False, 'active_streams': 0, 'active_runs': 0}):
+        result = updates.apply_force_update('webui')
+
+    for name, value in secrets.items():
+        assert value not in result['message'], f'{name} value leaked: {result["message"]!r}'
+    # The fetch failure (non-network) is still surfaced as a diagnostic.
+    assert result['message'].startswith('fetch failed:')
+    assert '<redacted>' in result['message']
+
+
 def test_check_for_updates_can_skip_agent_repo(tmp_path):
     """Ignoring Agent updates should still check WebUI but avoid touching Agent git."""
     webui_path = tmp_path / 'webui'
