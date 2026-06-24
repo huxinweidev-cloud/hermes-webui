@@ -3,6 +3,12 @@
 
 ## [Unreleased]
 
+## [v0.51.635] — 2026-06-24 — Release WP (no more "parse failed" note under JSON/YAML fragments)
+
+### Fixed
+
+- **JSON/YAML code blocks that aren't valid top-level documents no longer show a bare "parse failed" note.** The chat renderer's Tree-view affordance stamped an unstyled `parse failed` line below any fenced block it couldn't `JSON.parse` — but assistants routinely emit fragments (a bare `key: value` line, `…` snippets, trailing commas) that legitimately don't parse, so the note was pure noise under an otherwise-clean code box. Those blocks now fall through silently to the normal syntax-highlighted raw view; the per-block Raw/Tree toggle and the configurable default-view behavior are unchanged. Thanks @metaember. (#4858, #484)
+
 ## [v0.51.634] — 2026-06-24 — Release WO (faster profile list — skill stats are cached with an mtime probe)
 
 ### Fixed
