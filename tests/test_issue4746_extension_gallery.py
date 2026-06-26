@@ -93,6 +93,125 @@ def test_install_prefixed_zip(monkeypatch, tmp_path):
     assert "manifest.json" in manifest["installed"]["my-ext"]["files"]
 
 
+def test_gallery_installed_extension_becomes_runtime_manifest(monkeypatch, tmp_path):
+    """Installed gallery extensions are injected without a separate manifest env var."""
+    ext_dir, state_dir = _setup_ext_env(monkeypatch, tmp_path)
+    monkeypatch.delenv("HERMES_WEBUI_EXTENSION_MANIFEST", raising=False)
+    monkeypatch.delenv("HERMES_WEBUI_EXTENSION_SCRIPT_URLS", raising=False)
+    monkeypatch.delenv("HERMES_WEBUI_EXTENSION_STYLESHEET_URLS", raising=False)
+    import api.extensions as ext_mod
+
+    files = {
+        "my-ext/manifest.json": json.dumps(
+            {
+                "version": "1.0.0",
+                "extensions": [
+                    {
+                        "id": "my-ext",
+                        "name": "My Extension",
+                        "scripts": ["assets/app.js"],
+                        "stylesheets": ["assets/app.css"],
+                    }
+                ],
+            }
+        ),
+        "my-ext/assets/app.js": "console.log('gallery runtime');",
+        "my-ext/assets/app.css": "body{}",
+    }
+    zip_bytes = _make_zip(files)
+    sha = hashlib.sha256(zip_bytes).hexdigest()
+
+    monkeypatch.setattr(ext_mod, "_safe_download", lambda *a, **kw: zip_bytes)
+
+    ext_mod.install_extension(
+        "my-ext",
+        "https://hermes-webui.github.io/exts/my-ext.zip",
+        sha,
+    )
+
+    assert ext_mod.get_extension_config() == {
+        "enabled": True,
+        "script_urls": ["/extensions/my-ext/assets/app.js"],
+        "stylesheet_urls": ["/extensions/my-ext/assets/app.css"],
+    }
+    status = ext_mod.get_extension_status()
+    assert status["manifest"]["status"] == "gallery_installed"
+    assert status["counts"]["manifest_extensions"] == 1
+    assert status["extensions"][0]["id"] == "my-ext"
+
+
+def test_install_bootstraps_managed_default_root_without_env(monkeypatch, tmp_path):
+    """Plug-and-play (#4933): one-click install works with NO env configured.
+
+    With HERMES_WEBUI_EXTENSION_DIR unset and no extension dir on disk, the
+    first install must bootstrap the WebUI-managed default
+    (STATE_DIR/extensions), land the files there, and make the extension load
+    via get_extension_config() — all without any environment setup.
+    """
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    monkeypatch.delenv("HERMES_WEBUI_EXTENSION_DIR", raising=False)
+    monkeypatch.delenv("HERMES_WEBUI_EXTENSION_MANIFEST", raising=False)
+    monkeypatch.delenv("HERMES_WEBUI_EXTENSION_SCRIPT_URLS", raising=False)
+    monkeypatch.delenv("HERMES_WEBUI_EXTENSION_STYLESHEET_URLS", raising=False)
+    monkeypatch.setenv("HERMES_WEBUI_STATE_DIR", str(state_dir))
+    import api.extensions as ext_mod
+
+    monkeypatch.setattr(ext_mod, "_extension_state_dir", lambda: state_dir)
+
+    default_root = state_dir / "extensions"
+    # Pre-install: nothing exists yet, gallery is "configured" but not valid.
+    assert not default_root.exists()
+    pre = ext_mod.get_extension_status()
+    assert pre["enabled"] is False
+    assert pre["extension_dir_configured"] is True
+    assert pre["extension_dir_valid"] is False
+    assert pre["warnings"] == []
+
+    files = {
+        "plug-ext/manifest.json": json.dumps(
+            {
+                "version": "1.0.0",
+                "extensions": [
+                    {
+                        "id": "plug-ext",
+                        "name": "Plug And Play",
+                        "scripts": ["app.js"],
+                    }
+                ],
+            }
+        ),
+        "plug-ext/app.js": "console.log('plug and play');",
+    }
+    zip_bytes = _make_zip(files)
+    sha = hashlib.sha256(zip_bytes).hexdigest()
+    monkeypatch.setattr(ext_mod, "_safe_download", lambda *a, **kw: zip_bytes)
+
+    result = ext_mod.install_extension(
+        "plug-ext",
+        "https://hermes-webui.github.io/exts/plug-ext.zip",
+        sha,
+    )
+    assert result["installed"] is True
+
+    # The managed default root was created on demand and holds the files.
+    assert default_root.is_dir()
+    assert (default_root / "plug-ext" / "app.js").exists()
+
+    # And the extension now loads with zero env configuration.
+    assert ext_mod.get_extension_config() == {
+        "enabled": True,
+        "script_urls": ["/extensions/plug-ext/app.js"],
+        "stylesheet_urls": [],
+    }
+    status = ext_mod.get_extension_status()
+    assert status["enabled"] is True
+    assert status["extension_dir_configured"] is True
+    assert status["extension_dir_valid"] is True
+    assert status["manifest"]["status"] == "gallery_installed"
+    assert status["extensions"][0]["id"] == "plug-ext"
+
+
 def test_install_bad_hash(monkeypatch, tmp_path):
     ext_dir, state_dir = _setup_ext_env(monkeypatch, tmp_path)
     import api.extensions as ext_mod

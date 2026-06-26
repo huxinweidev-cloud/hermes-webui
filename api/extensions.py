@@ -126,30 +126,85 @@ _EXTENSION_MIME = {
 _TEXT_MIME_TYPES = {"text/css", "application/javascript", "text/html", "image/svg+xml", "text/plain"}
 
 
-def _extension_root() -> Optional[Path]:
-    """Return the configured extension directory, or None when disabled.
+def _default_extension_root() -> Path:
+    """WebUI-managed default extension directory under the state dir.
 
-    A missing or non-directory path disables extensions instead of failing open.
-    The startup docs encourage users to point this at a directory they control.
+    Used when ``HERMES_WEBUI_EXTENSION_DIR`` is unset so one-click gallery
+    install works out of the box on a single-user self-hosted instance with no
+    environment setup. It lives alongside sessions/settings in the WebUI-owned
+    state dir, which is a different trust domain from "a user-writable directory
+    on a shared box" — the loaded code still runs with full session authority,
+    so the trust model is unchanged (see docs/EXTENSIONS.md).
+    """
+    return _extension_state_dir() / "extensions"
+
+
+def _extension_root() -> Optional[Path]:
+    """Return the active extension directory, or None when none is available.
+
+    Resolution order:
+    1. ``HERMES_WEBUI_EXTENSION_DIR`` when set — must be an existing directory,
+       otherwise None (the admin owns that path; we never auto-create it).
+    2. Otherwise the WebUI-managed default (``STATE_DIR/extensions``) when it
+       already exists. The first gallery install creates it on demand
+       (see ``_writable_extension_root``); until then this stays None and the
+       UI reports the same "nothing installed yet" state as before.
     """
     raw = os.getenv(_EXTENSION_DIR_ENV, "").strip()
-    if not raw:
+    if raw:
+        root = Path(raw).expanduser().resolve()
+        if not root.exists() or not root.is_dir():
+            return None
+        return root
+    default_root = _default_extension_root()
+    try:
+        if default_root.is_dir() and not default_root.is_symlink():
+            return default_root.resolve()
+    except OSError:
         return None
-    root = Path(raw).expanduser().resolve()
-    if not root.exists() or not root.is_dir():
+    return None
+
+
+def _writable_extension_root() -> Optional[Path]:
+    """Resolve the extension root for writes, bootstrapping the managed default.
+
+    When ``HERMES_WEBUI_EXTENSION_DIR`` is set we use it as-is (the admin owns
+    it; it must already exist). When unset we create and return the
+    WebUI-managed default so a fresh install can install an extension with zero
+    configuration — plug and play.
+    """
+    raw = os.getenv(_EXTENSION_DIR_ENV, "").strip()
+    if raw:
+        return _extension_root()
+    default_root = _default_extension_root()
+    try:
+        default_root.mkdir(parents=True, exist_ok=True)
+    except OSError:
         return None
-    return root
+    try:
+        if default_root.is_symlink() or not default_root.is_dir():
+            return None
+        return default_root.resolve()
+    except OSError:
+        return None
 
 
 def _extension_root_status() -> Tuple[Optional[Path], bool, bool]:
-    """Return (root, configured, valid) without exposing the configured path."""
+    """Return (root, configured, valid) without exposing the configured path.
+
+    With no ``HERMES_WEBUI_EXTENSION_DIR`` the WebUI-managed default is always
+    available as an install target, so ``configured`` is True (extensions are
+    no longer "not configured" out of the box). ``valid`` reflects whether that
+    managed directory currently exists — it is created on the first install.
+    """
     raw = os.getenv(_EXTENSION_DIR_ENV, "").strip()
-    if not raw:
-        return None, False, False
-    root = Path(raw).expanduser().resolve()
-    if not root.exists() or not root.is_dir():
-        return None, True, False
-    return root, True, True
+    if raw:
+        root = Path(raw).expanduser().resolve()
+        if not root.exists() or not root.is_dir():
+            return None, True, False
+        return root, True, True
+    root = _extension_root()
+    return root, True, root is not None
 
 
 def _new_diagnostics() -> Dict[str, Any]:
@@ -417,7 +472,7 @@ def _manifest_path(root: Path) -> Optional[Path]:
     return manifest
 
 
-def _manifest_asset_url(value: object) -> str:
+def _manifest_asset_url(value: object, asset_base: str = "") -> str:
     """Normalize a manifest asset entry to the existing same-origin URL format."""
     if not isinstance(value, str):
         return ""
@@ -432,7 +487,32 @@ def _manifest_asset_url(value: object) -> str:
     # are still allowed and go through the same validator as env-configured URLs.
     if item.startswith("/"):
         return item
-    return EXTENSION_ROUTE_PREFIX + item
+    base = asset_base.strip("/")
+    rel = f"{base}/{item}" if base else item
+    return EXTENSION_ROUTE_PREFIX + rel
+
+
+def _manifest_asset_value_with_base(value: object, asset_base: str) -> object:
+    """Rewrite a manifest asset value so it remains relative to its manifest file."""
+    if not isinstance(value, str):
+        return value
+    item = value.strip()
+    if not item:
+        return item
+    parsed = urlsplit(item)
+    if parsed.scheme or parsed.netloc or item.startswith("//") or item.startswith("/"):
+        return item
+    base = asset_base.strip("/")
+    return f"{base}/{item}" if base else item
+
+
+def _copy_manifest_entry_with_asset_base(entry: Dict[str, object], asset_base: str) -> Dict[str, object]:
+    copied = dict(entry)
+    for key in ("scripts", "stylesheets"):
+        values = copied.get(key)
+        if isinstance(values, list):
+            copied[key] = [_manifest_asset_value_with_base(value, asset_base) for value in values]
+    return copied
 
 
 def _manifest_entry_text(entry: Dict[str, object], key: str) -> str:
@@ -606,11 +686,68 @@ def _empty_manifest_status(path_status: str) -> Dict[str, Any]:
         "configured": path_status != "not_configured",
         "loaded": False,
         "status": path_status,
+        "_asset_base": "",
         "entry_count": 0,
         "script_count": 0,
         "stylesheet_count": 0,
         "sidecar_count": 0,
     }
+
+
+def _manifest_asset_base(root: Path, manifest_file: Path) -> str:
+    try:
+        rel_parent = manifest_file.parent.relative_to(root).as_posix()
+    except ValueError:
+        return ""
+    return "" if rel_parent == "." else rel_parent
+
+
+def _gallery_installed_runtime_manifest(
+    root: Path, diagnostics: Optional[Dict[str, Any]] = None
+) -> Optional[Dict[str, object]]:
+    """Build a runtime manifest from gallery-installed extension manifests."""
+    install_manifest = _load_install_manifest()
+    installed = install_manifest.get("installed", {})
+    if not isinstance(installed, dict):
+        return None
+    entries: List[Dict[str, object]] = []
+    for ext_id in sorted(installed):
+        if not _valid_extension_id(ext_id):
+            continue
+        manifest_file = root / ext_id / "manifest.json"
+        try:
+            if not manifest_file.exists() or not manifest_file.is_file():
+                _add_diagnostic_warning(diagnostics, "gallery_manifest_missing", "gallery")
+                continue
+            manifest = json.loads(_read_manifest_text(manifest_file))
+        except _ManifestTooLarge:
+            _add_diagnostic_warning(diagnostics, "gallery_manifest_oversized", "gallery")
+            continue
+        except json.JSONDecodeError:
+            _add_diagnostic_warning(diagnostics, "gallery_manifest_malformed", "gallery")
+            continue
+        except RecursionError:
+            _add_diagnostic_warning(diagnostics, "gallery_manifest_too_deeply_nested", "gallery")
+            continue
+        except (OSError, UnicodeDecodeError):
+            _add_diagnostic_warning(diagnostics, "gallery_manifest_unreadable", "gallery")
+            continue
+        asset_base = ext_id
+        if isinstance(manifest, dict):
+            top_entry: Dict[str, object] = {"id": ext_id}
+            for key in ("name", "enabled", "scripts", "stylesheets", "sidecar"):
+                if key in manifest:
+                    top_entry[key] = manifest[key]
+            if any(key in top_entry for key in ("scripts", "stylesheets", "sidecar")):
+                entries.append(_copy_manifest_entry_with_asset_base(top_entry, asset_base))
+        for _source, _index, entry in _manifest_extension_entries(manifest):
+            copied = _copy_manifest_entry_with_asset_base(entry, asset_base)
+            if not _valid_extension_id(copied.get("id")):
+                copied["id"] = ext_id
+            entries.append(copied)
+    if not entries:
+        return None
+    return {"extensions": entries}
 
 
 def _load_manifest_with_status(
@@ -622,6 +759,17 @@ def _load_manifest_with_status(
     if manifest_file is None:
         if path_status == "invalid_path":
             _add_diagnostic_warning(diagnostics, "manifest_invalid_path", "manifest")
+        elif path_status == "not_configured":
+            manifest = _gallery_installed_runtime_manifest(root, diagnostics)
+            if manifest is not None:
+                manifest_status.update(
+                    {
+                        "loaded": True,
+                        "status": "gallery_installed",
+                        "_asset_base": "",
+                    }
+                )
+                return manifest, manifest_status
         return None, manifest_status
     try:
         if not manifest_file.exists() or not manifest_file.is_file():
@@ -630,7 +778,13 @@ def _load_manifest_with_status(
             _add_diagnostic_warning(diagnostics, "manifest_missing", "manifest")
             return None, manifest_status
         manifest = json.loads(_read_manifest_text(manifest_file))
-        manifest_status.update({"loaded": True, "status": "loaded"})
+        manifest_status.update(
+            {
+                "loaded": True,
+                "status": "loaded",
+                "_asset_base": _manifest_asset_base(root, manifest_file),
+            }
+        )
         return manifest, manifest_status
     except _ManifestTooLarge:
         _log.warning("Configured extension manifest exceeds %d bytes", _MAX_MANIFEST_BYTES)
@@ -729,6 +883,7 @@ def _read_manifest_urls_with_diagnostics(
     scripts: List[str] = []
     stylesheets: List[str] = []
     sidecars: List[Dict[str, str]] = []
+    asset_base = str(manifest_status.get("_asset_base", "") or "")
     entries = _iter_manifest_entries(manifest, disabled_ids=disabled_ids)
     manifest_status["entry_count"] = len(entries)
     scripts_full = False
@@ -751,7 +906,7 @@ def _read_manifest_urls_with_diagnostics(
             for value in _entry_asset_values(entry, "scripts"):
                 if not _append_safe_asset_url(
                     scripts,
-                    _manifest_asset_url(value),
+                    _manifest_asset_url(value, asset_base),
                     script_source,
                     diagnostics=diagnostics,
                 ):
@@ -761,7 +916,7 @@ def _read_manifest_urls_with_diagnostics(
             for value in _entry_asset_values(entry, "stylesheets"):
                 if not _append_safe_asset_url(
                     stylesheets,
-                    _manifest_asset_url(value),
+                    _manifest_asset_url(value, asset_base),
                     stylesheet_source,
                     diagnostics=diagnostics,
                 ):
@@ -770,7 +925,7 @@ def _read_manifest_urls_with_diagnostics(
     manifest_status.update(
         {
             "loaded": True,
-            "status": "loaded",
+            "status": manifest_status.get("status") or "loaded",
             "script_count": len(scripts),
             "stylesheet_count": len(stylesheets),
             "sidecar_count": len(sidecars),
@@ -824,7 +979,12 @@ def get_extension_status() -> Dict[str, Any]:
         "stylesheet_count": 0,
         "sidecar_count": 0,
     }
-    if dir_configured and not dir_valid:
+    # Only warn about an unavailable directory when the admin explicitly set
+    # HERMES_WEBUI_EXTENSION_DIR to a path that is missing/not-a-dir. The
+    # WebUI-managed default simply not existing yet (pre-first-install) is the
+    # normal opt-in state, not a misconfiguration worth surfacing.
+    env_dir_set = bool(os.getenv(_EXTENSION_DIR_ENV, "").strip())
+    if env_dir_set and dir_configured and not dir_valid:
         _add_diagnostic_warning(diagnostics, "extension_dir_unavailable", "extension_dir")
 
     if root is None:
@@ -873,6 +1033,9 @@ def get_extension_status() -> Dict[str, Any]:
         manifest_stylesheets or None,
         diagnostics=diagnostics,
     )
+    public_manifest_status = {
+        key: value for key, value in manifest_status.items() if not key.startswith("_")
+    }
     return {
         "enabled": True,
         "extension_dir_configured": True,
@@ -887,7 +1050,7 @@ def get_extension_status() -> Dict[str, Any]:
             "manifest_extensions": len(extensions),
             "user_disabled": user_disabled_count,
         },
-        "manifest": manifest_status,
+        "manifest": public_manifest_status,
         "extensions": extensions,
         "gallery_installed": _load_install_manifest().get("installed", {}),
         "warnings": diagnostics["warnings"],
@@ -1004,7 +1167,7 @@ def install_extension(id: object, download_url: object, sha256: object) -> Dict[
         raise ExtensionInstallError("Invalid download URL")
     if not isinstance(sha256, str) or not re.fullmatch(r"[0-9a-f]{64}", sha256):
         raise ExtensionInstallError("Invalid sha256")
-    root = _extension_root()
+    root = _writable_extension_root()
     if root is None:
         raise ExtensionInstallError("Extensions not configured", 404)
     try:
