@@ -4629,6 +4629,7 @@ function _memorySectionPath(key) {
   if (key === 'user') return _memoryData.user_path || '';
   if (key === 'soul') return _memoryData.soul_path || '';
   if (key === 'project_context') return _memoryData.project_context_path || '';
+  // Intentional default: the primary "memory" section remains the fallback.
   return _memoryData.memory_path || '';
 }
 

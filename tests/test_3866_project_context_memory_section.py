@@ -202,9 +202,13 @@ function esc(value) {
 eval(helperBlock + "\n" + renderBlock);
 _renderMemoryDetail('memory');
 const memoryHtml = nodes.memoryDetailBody.innerHTML;
+_renderMemoryDetail('user');
+const userHtml = nodes.memoryDetailBody.innerHTML;
+_renderMemoryDetail('soul');
+const soulHtml = nodes.memoryDetailBody.innerHTML;
 _renderMemoryDetail('project_context');
 const projectHtml = nodes.memoryDetailBody.innerHTML;
-console.log(JSON.stringify({memoryHtml, projectHtml, memoryMode: _memoryMode}));
+console.log(JSON.stringify({memoryHtml, userHtml, soulHtml, projectHtml, memoryMode: _memoryMode}));
 """
     )
     completed = subprocess.run(
@@ -232,6 +236,10 @@ def test_memory_detail_renders_path_for_non_project_sections():
 
     assert "MEMORY.md" in rendered["memoryHtml"]
     assert "C:/Users/Rod/.hermes/memories/MEMORY.md" in rendered["memoryHtml"]
+    assert "USER.md" in rendered["userHtml"]
+    assert "C:/Users/Rod/.hermes/memories/USER.md" in rendered["userHtml"]
+    assert "SOUL.md" in rendered["soulHtml"]
+    assert "C:/Users/Rod/.hermes/SOUL.md" in rendered["soulHtml"]
     assert "AGENTS.md · D:/Repos/hermes-webui/AGENTS.md" in rendered["projectHtml"]
     assert "CLAUDE.md present, shadowed by AGENTS.md" in rendered["projectHtml"]
 
