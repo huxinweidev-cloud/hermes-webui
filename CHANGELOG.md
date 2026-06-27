@@ -3,6 +3,142 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- **Installing an extension now shows its post-install next steps.** Some extensions need a follow-up step after install (run a setup command, restart, configure a key). The Settings → Extensions gallery now renders that guidance from the extension's own registry metadata — generic `post_install` text and lifecycle requirements, with an optional docs link — right on the card, plus a "see the card for next steps" install toast. The guidance is registry-driven (no vendor special-casing), every value is HTML-escaped, any docs URL is validated to safe http(s) before it's linked, and the note degrades cleanly when an extension declares no post-install steps. Thanks @franksong2702. (#4964, fixes #4959)
+
+- **The Settings → Extensions diagnostics panel now shows per-extension sidecar runtime status.** When an extension's loopback sidecar health response includes an optional top-level `runtime` object, the diagnostics panel parses it and renders only allowlisted scalar fields (sidecar/native-host/bridge status, last-seen time, and the loopback origin) so you can see at a glance whether an extension's helper process is running, waiting, or stale — without WebUI depending on any one extension's private payload shape. All values are status-enum-allowlisted, HTML-escaped, timestamp-validated, and origin-limited to `http://127.0.0.1`/`localhost`; a missing or malformed `runtime` object degrades cleanly, and a failed diagnostics refresh now renders the error instead of staying stuck on "Loading…". Thanks @franksong2702. (#4979)
+
+- **The "Response complete" notification now previews the final answer, not the start of the stream.** The browser/PWA completion notification body was built from the live streaming accumulator sliced to 100 chars, so it showed the *beginning* of the response (often a preamble or empty) rather than what the user actually got. It now derives the preview from the settled final answer (anchor projection → message content → raw text), strips inline thinking, normalizes whitespace, and truncates at 100 chars — and works for completions that finish while the session isn't the active pane. Thanks @claw-io. (#5036, fixes #5035)
+
+- **Onboarding now has the same searchable model picker as Settings.** A fresh install (e.g. an OpenRouter-only first run) previously showed only a small default model list in the onboarding step — no search box and no way to enter a custom model ID — so picking a model not in the short list meant finishing setup and fixing it later. Onboarding now reuses the same searchable picker (with custom-model-ID entry) that Settings uses, instead of a separate onboarding-only dropdown that could drift. The custom-provider free-text branch is unchanged, and the plain-`<select>` fallback (when the shared picker is unavailable) correctly preserves a saved/default model instead of resetting to the first option. Thanks @rodboev. (#5031, fixes #4706)
+
+- **French localization is complete again — 40 missing UI strings now have French translations.** The `fr` locale was missing ~40 keys that exist in English (goal status messages, profile management, session metadata, upload/checkpoint messages, "Open in VS Code", and more), so those strings fell back to English for French users. All 40 are now translated, idiomatic-French wording fixes from the contributor are applied (including correcting a machine-mistranslation of "Steer" → "Bœuf"/beef), and the `theme_usage` non-breaking space before the colon is preserved per French typography. Thanks @Pichatu. (#4876)
+
+- **The Settings → Appearance tab-visibility chips are legible in the Graphite light theme again.** The `.tab-visibility-chip` painted hardcoded near-black text (`#1a1a1a`) on `background:var(--accent)`, which resolves to a dark gray (`#303030`) in the Graphite light skin — making the chip labels invisible. The chip now uses the theme-aware token pattern shared by the other chips (`background:var(--accent-bg)` light tint + `border:var(--accent-bg-strong)` + `color:var(--accent-text)`), so labels stay readable across every skin and theme. Thanks @luandnh. (#4888)
+- **The Memory panel now shows the on-disk file path for every memory section, not just project context.** The detail header already rendered the `FILE.md · /full/path` row for the project-context section; it now generalizes the path lookup so the Memory, User, and Soul sections each surface their existing backend `*_path` field too. Thanks @rodboev. (#5025, fixes #4999)
+- **The dashboard rail link no longer shows in the mobile sidebar nav.** A desktop-oriented dashboard entry was appearing in the narrow-viewport vertical `.sidebar-nav` rail; a CSS-only narrow-viewport override hides it inside `.sidebar-nav` while leaving the desktop rail button untouched. Thanks @rodboev. (#4997, closes #4712)
+
+## [v0.51.692] — 2026-06-27 — Release YV (the post-upgrade 401 recovery now also covers the boot model fetch)
+
+### Fixed
+
+- **The post-upgrade boot no longer loops on a `/api/models` 401 either.** #5018 bounded the active-profile boot 401 loop, but boot then continued into the model-dropdown fetch (`/api/models`), whose 401 still routed through the shared `_redirectIfUnauth()` helper — re-opening the same redirect loop the earlier fix closed. The boot path now bounds the `/api/models` 401 redirect through the **same shared boot budget** as the active-profile read, so a single boot redirects to login at most once and then proceeds/falls back instead of looping. The shared `_redirectIfUnauth()` helper is unchanged for non-boot callers (session-visit refreshes, uploads still redirect normally on a 401), a genuinely logged-out user still reaches login, and the budget resets on a successful/fresh boot. Thanks @rodboev. (#5026, fixes #5021)
+
+## [v0.51.691] — 2026-06-27 — Release YU (auth-persistence failures are surfaced, never silently brick or degrade)
+
+### Fixed
+
+- **A corrupt or unreadable auth session store / signing key no longer silently degrades — or bricks — WebUI.** Session-verification survival depends on `.sessions.json` and `.signing_key` under `STATE_DIR`; previously read/write failures were hidden behind debug-only logs, so after a restart/upgrade a user could land in a dead-session state with no actionable signal. These failures are now promoted to warnings (with the artifact path + `STATE_DIR` + consequence, never any key or token material). The session loader is fully fail-open: a missing, unreadable, malformed-UTF-8, malformed-JSON, deeply-nested (RecursionError), or wrong-shape sessions file now warns and starts with an empty session table instead of letting the exception escape and block startup. Thanks @rodboev. (#5023, fixes #5022)
+
+## [v0.51.690] — 2026-06-27 — Release YT (a fresh blank boot binds the profile's default workspace)
+
+### Fixed
+
+- **Opening WebUI on a fresh/blank boot now binds the profile's default workspace**, so the first session starts in the right workspace instead of an unbound/empty one. The bind helper now runs at **both** empty-state boot entry points — the ephemeral-scratch path (after the active-profile bootstrap resolves) and the no-saved-session path — so neither fresh-boot route is left without a workspace. It's a no-op when a real saved session or explicit workspace already exists (returning users are unaffected), and it runs after the post-upgrade 401 recovery (#5018) so the two boot paths don't interact. Thanks @rodboev. (#4971, fixes #4877)
+
+## [v0.51.689] — 2026-06-26 — Release YS (WebUI no longer gets stuck in a 401 loop after an upgrade)
+
+### Fixed
+
+- **WebUI no longer hangs in a repeating `401` loop on `GET /api/profile/active` after an upgrade.** The boot path inherited the shared `api()` helper's automatic 401→login redirect and kept retrying the active-profile bootstrap read without a bounded decision, so a post-upgrade session-not-re-established state could spin indefinitely and leave the app unresponsive. The bootstrap read now opts out of the automatic redirect (`redirect401: false`, scoped to this one call) and a dedicated `_resolveActiveProfileBootstrapState()` makes a one-shot recovery decision: on the first 401 it redirects to login once; if that's already been attempted it falls back to the default profile for display. The one-shot marker is cleared on both success and fallback, so a recovered/re-logged-in user re-establishes their real profile normally — and a genuinely logged-out user still gets the normal login redirect (server auth/profile cookies remain authoritative; the fallback is display-state only). Reported by the community. Thanks @rodboev. (#5018, fixes #5001)
+
+## [v0.51.688] — 2026-06-26 — Release YR (docs: clarify how WebUI chat runs by default)
+
+### Changed
+
+- **README: clarified that WebUI runs the Hermes agent in-process by default** (reading `HERMES_HOME` directly) rather than connecting to an external Hermes/agent OpenAI-compatible API server, and that `HERMES_API_URL` is only read by the Tasks/cron health probe — it does not route chat. Documents the two supported options for an external endpoint (add it as a custom OpenAI-compatible chat provider, or route chat through a Hermes Gateway via `HERMES_WEBUI_CHAT_BACKEND=gateway`, see `docs/advanced-chat-setup.md`). Addresses a recurring user confusion (#3873). Thanks @sr-dotcom. (#5015)
+
+## [v0.51.687] — 2026-06-26 — Release YQ (system-health CPU/RAM metrics work on macOS and other non-procfs platforms)
+
+### Fixed
+
+- **The system-health panel now reports CPU/RAM on macOS and other platforms without `/proc`.** The aggregate CPU/RAM collectors only read Linux procfs, so on macOS those metrics failed. They now fall back to `psutil` when procfs is unavailable. `psutil` is kept **optional** (listed only as a comment in `requirements.txt`, matching the `edge-tts` opt-in pattern — base installs stay lean): on Linux procfs is always hit first and `psutil` is never imported; on a non-procfs platform with `psutil` installed the fallback works; without it, the affected metric degrades to "unavailable" with no crash. Thanks @jkobject. (#4616)
+
+## [v0.51.686] — 2026-06-26 — Release YP (internal: enhanced-table copy boundary-case test coverage)
+
+### Changed
+
+- **Internal (tests only): added regression coverage for two enhanced-table copy boundary cases** flagged as optional follow-ups when the #4945 fix shipped — a selection anchored on the `<table>` element itself, and a selection that starts in a table cell and ends in surrounding prose. Both must fall through to native copy, and the shipped guard already handles them correctly (verified, no production change). Closes the coverage gap so a future refactor of the copy interceptor can't silently regress these paths. Thanks @rodboev. (#5013, follow-up to #4945/#4994)
+
+## [v0.51.685] — 2026-06-26 — Release YO (internal: session-list cache extracted to its own module)
+
+### Changed
+
+- **Internal refactor (no behavior change): the session-list cache cluster moved out of `api/routes.py` into a dedicated `api/route_session_list_cache.py` module**, re-exported from `api.routes` so every caller, test, and import keeps working. This continues the incremental router-slimming (#1907 / the #3575 pattern) on a hot merge surface — every HTTP entrypoint stays in `routes.py`, and the cache state, locks, single-flight/inflight events, rebuild-thread ownership, and invalidation/stamp logic are preserved exactly (cross-module invalidation verified: the shared objects are accessed live via module attribute, never stale-imported). Thanks @rodboev. (#5004, #1907)
+
+## [v0.51.684] — 2026-06-26 — Release YN (copying a rendered table no longer drags its sort/filter chrome — or eats surrounding text)
+
+### Fixed
+
+- **Copying a rendered markdown table now produces clean table text instead of the enhanced sort/filter chrome and dark styling — without clobbering other selected content.** After WebUI enhances a table (header cells wrapped in sort buttons, filter UI inserted), a full-table copy carried that markup and dropped the header row. A copy interceptor now reconstructs clean table markup (header preserved, chrome stripped, dark inline styling removed, cell content HTML-escaped) — but only for a *full* enhanced-table selection. A partial selection (a few cells, one row/column), or a selection that merely crosses the table (text before → table → text after), falls through to native copy unchanged, so neither the surrounding prose nor a sub-selection is lost. Thanks @rodboev. (#4994, fixes #4945)
+
+## [v0.51.683] — 2026-06-26 — Release YM (WebUI finds the agent for pip-style installs — no more cron.jobs import error)
+
+### Fixed
+
+- **WebUI now locates the agent on pip-style installs, fixing a `ModuleNotFoundError: No module named 'cron.jobs'`.** Agent-directory discovery only accepted a source checkout containing `run_agent.py`, so a pip-style layout that ships the cron jobs module without that entrypoint left the agent dir unset and the cron import unrepaired. Discovery now also recognizes a pip-style root (the cron jobs module plus a real `hermes_cli` package signal), in an ordered search that always prefers a genuine `run_agent.py` checkout before any pip-style candidate — so a real checkout can never be preempted by a lookalike — and the pip-style marker is strict enough (requires `hermes_cli`, not a bare generic directory) that a non-agent folder can't false-match. Thanks @rodboev. (#4998, fixes #4700)
+
+## [v0.51.682] — 2026-06-26 — Release YL (faster long-session open — indexed compression-continuation lookup)
+
+### Fixed
+
+- **Opening a session with a compression snapshot is faster, and still resolves to the correct live continuation.** The pre-compression snapshot continuation lookup scanned and JSON-parsed every session sidecar to find the live child; it now uses the session index as a fast path (one directory listing + one index read, no per-sidecar parse). Correctness is preserved by a membership-completeness guard: if any persisted continuation sidecar is missing from the index, the lookup falls back to the full sidecar scan — so a stale index can't silently drop a continuation and surface the archived snapshot instead of the live conversation. The index parse no longer mutates the shared ancestor set, and ties on `updated_at` resolve deterministically by `session_id` so the fast path and the scan path are byte-identical. Thanks @franksong2702. (#4991, fixes #4990)
+
+## [v0.51.681] — 2026-06-26 — Release YK (Anthropic shows in the model picker when configured via OAuth token)
+
+### Fixed
+
+- **The model picker now detects Anthropic when it's configured through an OAuth token instead of `ANTHROPIC_API_KEY`.** WebUI's env-fallback provider detection only looked for `ANTHROPIC_API_KEY`, so an Anthropic setup using OAuth token env vars (`ANTHROPIC_TOKEN` / `CLAUDE_CODE_OAUTH_TOKEN`, which the shared agent already accepts) fell out of parity and the provider didn't surface. The fallback now derives the Anthropic env-var set from the shared agent provider registry (with a built-in fallback list), and env values are stripped before the availability check so a whitespace-only token can't false-positive the provider. Thanks @rodboev. (#4995, fixes #4770)
+
+## [v0.51.680] — 2026-06-26 — Release YJ (session-index rebuild can't be clobbered by a late worker)
+
+### Fixed
+
+- **A late-finishing background session-index rebuild can no longer clobber a newer rebuild's state.** When a session-index rebuild worker finished, it cleared the rebuild bookkeeping globals if only the target tuple matched — so an older worker completing after a newer rebuild had already taken over could wipe the newer owner's registration. The cleanup now also requires that the finishing worker is still the registered owner thread (`_SESSION_INDEX_REBUILD_THREAD is current_thread`, checked under the rebuild lock), so an out-of-order older worker leaves the newer owner's state intact while the genuine owner still clears normally. Thanks @rodboev. (#4993, #3894)
+
+## [v0.51.679] — 2026-06-26 — Release YI (faster fresh sidebar boot — parallel session/project fetches)
+
+### Fixed
+
+- **Opening a fresh tab / cold sidebar boot is faster.** The boot sequence fetched the session list (`/api/sessions`) and the project list (`/api/projects`) one after the other; the two are independent reads, so they now run concurrently — the project fetch is kicked off immediately and awaited after the session fetch. Error handling is unchanged: a failing project fetch still falls back to the cached project list without dropping the session list, and the session-fetch error/timeout path is untouched. Thanks @rodboev. (#4992, fixes #4759)
+
+## [v0.51.678] — 2026-06-26 — Release YH (the chat no longer jumps to the bottom right after a reply renders)
+
+### Fixed
+
+- **Live-follow no longer breaks (and the transcript no longer snaps back to the bottom) from a phantom scroll right after a message renders.** After a normal `renderMessages()` (send / late-layout-settle), the browser could emit a spurious upward `scroll` event with no real user intent, which set the "user scrolled up" flag and broke scroll-follow. The post-render window now suppresses that artifact — but only when there's genuinely no recent user scroll intent, across every modality: wheel (including gentle low-delta trackpad scrolls below the unpin threshold), touch, scrollbar drag, and keyboard scrolling (PageUp/PageDown/arrows/Space/Home/End). A real upward scroll by any of those still unpins immediately, the intent state is cleared on session-switch and stream-reset (so it can't leak across conversations), and pressing Space to activate a focused transcript control is not mistaken for a scroll. Follow-up to the #4934 DOM-wipe clamp. Thanks @allenliang2022. (#4970)
+
+## [v0.51.677] — 2026-06-26 — Release YG (cron run logs render as literal text, not mangled markdown)
+
+### Fixed
+
+- **Cron job run logs (prompt/response in the cron detail panel) now render as literal preformatted text instead of being mangled by Markdown.** The expanded run body and the "View full output" view passed raw output through `renderMd()`, so JSON/plain-text logs lost their newlines, had special characters interpreted, and lines beginning with `#`/`|`/`>` turned into headings/tables/blockquotes. Both paths now render via a DOM-created `<pre><code>` with `textContent`, preserving whitespace exactly and rendering nothing as Markdown (also XSS-safe — no `innerHTML` on raw output). The usage footer and action button stay outside the preformatted block. Thanks @luandnh. (#4977)
+
+## [v0.51.676] — 2026-06-26 — Release YF (submitted message no longer renders twice — or vanishes — on active reload)
+
+### Fixed
+
+- **On an active-session reload/reconnect, the submitted user turn no longer renders twice (and a distinct repeated prompt no longer vanishes).** The browser can see the current turn through several recovery sources (optimistic/in-flight, `pending_user_message`, replay/checkpoint), and the de-duplication had to balance two failure modes. Pending/in-flight user-turn dedupe is now scoped to the **current-turn tail** only (stopping at the most recent non-live assistant), so: a genuine double-render of the *same* current turn is still collapsed to one, while a *new* turn whose text matches an *earlier* historical message (e.g. sending the same prompt twice, including under the default deferred save mode where only `pending_user_message` exists) is correctly preserved instead of being suppressed. Display-only wrappers (workspace/attachment/forced-skill envelopes) are normalized for the comparison; pending attachments reattach only on a genuine same-turn match. Thanks @franksong2702. (#4826, fixes #4825)
+
+## [v0.51.675] — 2026-06-26 — Release YE (long conversations open fast — bounded state.db tail reads)
+
+### Fixed
+
+- **Opening a long conversation no longer shows "Loading…" for 1-2 seconds.** `/api/session` loaded the entire `state.db` message history before trimming to the visible window; for an 844-message session that cold read took ~1.75s. The paginated path now pushes the client's `msg_limit` into SQL via a `since_timestamp` floor derived from the sidecar tail, reading only the tail window (expected drop to a few hundred ms). The optimization is taken only when it is provably output-identical to the full read: it keeps NULL-timestamp rows (`timestamp IS NULL OR timestamp >= ?`), and a below-floor prefix guard compares the **full merge identity** (`role`, `content`, and parsed `tool_calls`) between the sidecar and `state.db` prefixes — bailing to the full read whenever they can't be proven equal (or the schema lacks the needed columns), so `message_count`/`_messages_offset` and "load older" paging stay byte-identical. Callers needing all rows are unaffected (the floor is opt-in). Thanks @franksong2702. (#4920, fixes #4918 Problem-1)
+
+## [v0.51.674] — 2026-06-26 — Release YD (server no longer exhausts threads under sidebar-poll load)
+
+### Fixed
+
+- **The server no longer runs out of OS threads (and stops accepting connections) under sustained `/api/sessions` load.** The slow-request diagnostics helper spawned a fresh `threading.Timer` — one OS thread — for every tracked request (the high-frequency sidebar poll and chat-start), held alive until the request finished. Under sustained load that exhausted the per-process thread cap (`RuntimeError: can't start new thread`), failing both the diagnostics timer and the HTTP request worker, after which new connections were refused. The per-request timer is replaced with a single process-global watchdog daemon thread that scans in-flight requests on a ~1s tick, so timeout tracking now costs one thread per process regardless of request rate. Diagnostics behavior (slow-request warnings) is unchanged. Reported by enihcam. (#4973)
+
+## [v0.51.673] — 2026-06-26 — Release YC (a stale approval card clears instead of dead-ending)
+
+### Fixed
+
+- **A stale command-approval card now clears instead of dead-ending on "Approval response not accepted." (#4948 local variant, #4771 follow-up).** On the default local backend, if an approval card was still on screen when its turn ended (cancel, fork, provider error, or normal completion while pending), clicking Approve/Deny sent an id that no longer matched anything and the card got stuck behind that error toast. The server now distinguishes a genuinely stale card (nothing pending for the session → clears the orphan card) from a stale-id click made while a *different* approval is still live (still rejected, so it can never resolve the wrong command — #527 preserved). Reported by santastabber and b3nw.
+
 ## [v0.51.672] — 2026-06-26 — Release YB (faster cron sidebar rebuild on stores missing the message index)
 
 ### Fixed

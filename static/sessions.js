@@ -581,7 +581,9 @@ function _inflightHasVisibleLiveState(inflight) {
   if (Array.isArray(inflight.activityBurstAnchors) && inflight.activityBurstAnchors.length) return true;
   if (Array.isArray(inflight.messages)) {
     return inflight.messages.some((msg) => {
-      if (!msg || msg.role !== 'assistant') return false;
+      if (!msg) return false;
+      if (msg.role === 'user') return Boolean(_messageComparableText(msg));
+      if (msg.role !== 'assistant') return false;
       const content = msg.content;
       if (typeof content === 'string') return content.trim();
       if (Array.isArray(content)) return content.length > 0;
@@ -1292,11 +1294,18 @@ async function loadSession(sid){
   S._pendingSessionToolsets=null;
   if(typeof populateModelDropdown==='function'){
     const modelRefreshSid=sid;
-    const modelRefreshPromise=Promise.resolve().then(()=>{
-      if(_loadingSessionId!==modelRefreshSid) return;
-      return populateModelDropdown({freshness:'session_visit'});
-    }).catch(()=>{});
-    if(typeof window!=='undefined') window._modelDropdownReady=modelRefreshPromise;
+    if(!S._bootReady&&typeof window!=='undefined'&&typeof window._startBootModelDropdown==='function'){
+      Promise.resolve().then(()=>{
+        if(_loadingSessionId!==modelRefreshSid) return;
+        return window._startBootModelDropdown();
+      }).catch(()=>{});
+    }else{
+      const modelRefreshPromise=Promise.resolve().then(()=>{
+        if(_loadingSessionId!==modelRefreshSid) return;
+        return populateModelDropdown({freshness:'session_visit'});
+      }).catch(()=>{});
+      if(typeof window!=='undefined') window._modelDropdownReady=modelRefreshPromise;
+    }
   }
   if(typeof _hydrateTodosFromSession==='function') _hydrateTodosFromSession(S.session);
   S.session._modelResolutionDeferred=true;
@@ -1346,8 +1355,9 @@ async function loadSession(sid){
     if(!Array.isArray(messages)) return false;
     const pendingMsg=typeof getPendingSessionMessage==='function'?getPendingSessionMessage(session,messages):null;
     if(!pendingMsg) return false;
-    if(messages.some(existing=>_sameTranscriptMessage(existing,pendingMsg))) return false;
     const liveAssistantIdx=messages.findIndex(m=>m&&m.role==='assistant'&&m._live);
+    const currentTurnMessages=liveAssistantIdx>=0?messages.slice(0,liveAssistantIdx):messages;
+    if(_hasCurrentTailUserDuplicate(currentTurnMessages,pendingMsg)) return false;
     if(liveAssistantIdx>=0) messages.splice(liveAssistantIdx,0,pendingMsg);
     else messages.push(pendingMsg);
     return true;
@@ -2325,6 +2335,32 @@ function _stripAttachedFilesMarker(text){
   return String(text||'').replace(/\n\n\[Attached files: [^\]]+\]$/,'').trim();
 }
 
+function _stripForcedSkillEnvelope(text){
+  let value=String(text||'').trim();
+  // `/use <skill>` augments the model-facing prompt with a directive and a
+  // hidden skill-content envelope, while the optimistic UI row keeps the human
+  // prompt.  Treat them as the same submitted turn for active reload/reconnect
+  // dedupe without rewriting the persisted pending prompt.
+  value=value.replace(/^\[USER OVERRIDE\][^\n]*\n*/,'').trim();
+  value=value.replace(/\[FORCED SKILL CONTEXT:[^\]]+\][\s\S]*?\[\/FORCED SKILL CONTEXT\]\s*/g,'').trim();
+  return value;
+}
+
+function _normalizeUserTranscriptText(text){
+  const value=_stripAttachedFilesMarker(_stripForcedSkillEnvelope(text));
+  // ui.js is loaded before sessions.js in index.html and owns the canonical
+  // workspace-sentinel parser used by rendering.  Keep a small fallback for
+  // static/helper tests and defensive partial loads, but prefer the renderer's
+  // parser whenever it is available.
+  if(typeof _stripWorkspaceDisplayPrefix==='function'){
+    return _stripWorkspaceDisplayPrefix(value);
+  }
+  const raw=String(value||'');
+  const strippedV1=raw.replace(/^\s*\[Workspace::v1:\s*(?:\\.|[^\]\\])+\]\s*/,'');
+  if(strippedV1!==raw) return strippedV1.trim();
+  return raw.replace(/^\s*\[Workspace:[^\]]+\]\s*/,'').trim();
+}
+
 function _sameTranscriptMessage(a,b){
   if(!(a&&b)) return false;
   const role=String(a.role||'');
@@ -2333,9 +2369,27 @@ function _sameTranscriptMessage(a,b){
   const bText=_messageComparableText(b);
   if(aText===bText) return true;
   if(role==='user'){
-    return _stripAttachedFilesMarker(aText)===_stripAttachedFilesMarker(bText);
+    return _normalizeUserTranscriptText(aText)===_normalizeUserTranscriptText(bText);
   }
   return false;
+}
+
+function _currentTailUserMessage(messages){
+  const list=Array.isArray(messages)?messages:[];
+  for(let i=list.length-1;i>=0;i--){
+    const msg=list[i];
+    if(!msg) continue;
+    if(String(msg.role||'')==='user') return msg;
+    if(msg._live||String(msg.role||'')==='tool') continue;
+    return null;
+  }
+  return null;
+}
+
+function _hasCurrentTailUserDuplicate(messages,candidate){
+  if(!candidate||String(candidate.role||'')!=='user') return false;
+  const existing=_currentTailUserMessage(messages);
+  return !!(existing&&_sameTranscriptMessage(existing,candidate));
 }
 
 function _currentTurnAssistantText(messages){
@@ -2630,7 +2684,9 @@ function _mergeInflightTailMessages(baseMessages, inflightMessages){
   for(const msg of tail){
     let candidate=msg;
     if(!candidate) continue;
-    const duplicate=merged.slice(-Math.max(5,tail.length+2)).some(existing=>_sameTranscriptMessage(existing,candidate));
+    const duplicate=String(candidate.role||'')==='user'
+      ? _hasCurrentTailUserDuplicate(merged,candidate)
+      : merged.slice(-Math.max(5,tail.length+2)).some(existing=>_sameTranscriptMessage(existing,candidate));
     if(!duplicate) merged.push(candidate);
   }
   return merged;
@@ -4099,16 +4155,7 @@ async function _runRenderSessionListRefresh(opts, _gen){
       retryTimeouts:true,
       retryStatuses:[502,503,504],
     };
-    const sessData = _sessionListHasLoadedOnce
-      ? await api('/api/sessions' + sessionListQS,{timeoutToast:false})
-      : await api('/api/sessions' + sessionListQS,sessionRequestOpts);
-    let projData={projects:_allProjects||[]};
-    try{
-      const projectQS = _showAllProfiles ? '?all_profiles=1' : '';
-      projData = await api('/api/projects' + projectQS,{timeoutToast:false});
-    }catch(projectError){
-      console.warn('renderProjectsList',projectError);
-    }
+    const {sessData, projData}=await _loadSidebarSessionListPayload(sessionListQS, sessionRequestOpts);
     // Discard stale response — a newer renderSessionList() call superseded us.
     if (_gen !== _renderSessionListGen) return;
     // #4671: while a profile switch is mid-flight, drop ANY payload — even one whose
@@ -4160,6 +4207,25 @@ async function _runRenderSessionListRefresh(opts, _gen){
       renderSessionListFromCache();
     }
   }
+}
+
+async function _loadSidebarSessionListPayload(sessionListQS, sessionRequestOpts){
+  const projectPromise = (async() => {
+    try{
+      const projectQS = _showAllProfiles ? '?all_profiles=1' : '';
+      return await api('/api/projects' + projectQS,{timeoutToast:false});
+    }catch(projectError){
+      console.warn('renderProjectsList',projectError);
+      return {projects:_allProjects||[]};
+    }
+  })();
+
+  const sessData = _sessionListHasLoadedOnce
+    ? await api('/api/sessions' + sessionListQS,{timeoutToast:false})
+    : await api('/api/sessions' + sessionListQS,sessionRequestOpts);
+  const projData = await projectPromise;
+
+  return {sessData,projData};
 }
 
 async function _drainRenderSessionListQueue(initialRequest){
