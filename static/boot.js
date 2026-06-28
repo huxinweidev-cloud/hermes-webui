@@ -85,7 +85,7 @@ async function _savedSessionShouldStaySidebarOnly(sid){
   try{
     const data = await api(`/api/session?session_id=${encodeURIComponent(sid)}&messages=0&resolve_model=0`);
     const session = data&&data.session;
-    return !!(session&&(session.active_stream_id||session.pending_user_message));
+    return !!(session&&(session.active_stream_id||session.pending_user_message||session.archived));
   }catch(e){
     return false;
   }

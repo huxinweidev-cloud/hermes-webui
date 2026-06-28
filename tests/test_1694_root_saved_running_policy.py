@@ -72,6 +72,10 @@ def test_saved_running_session_helper_uses_metadata_only_and_runtime_markers():
     assert "resolve_model=0" in helper, "helper must avoid unnecessary model resolution"
     assert "active_stream_id" in helper, "helper must treat active_stream_id as running"
     assert "pending_user_message" in helper, "helper must treat pending_user_message as running"
+    assert "session.archived" in helper, (
+        "helper must skip auto-opening archived localStorage sessions so root "
+        "boot lands on the empty state instead of reopening archived chats"
+    )
     assert "loadSession(" not in helper, (
         "helper must not call loadSession(), because that would already project "
         "the saved session into the active pane"

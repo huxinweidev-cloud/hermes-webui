@@ -3558,6 +3558,7 @@ async function _archiveSession(session, archived=true, beforeListRender=null){
     const cached=(_allSessions||[]).find(s=>s&&s.session_id===session.session_id);
     if(cached) cached.archived=archived;
     if(S.session&&S.session.session_id===session.session_id) S.session.archived=archived;
+    try{ if(archived&&session.session_id&&localStorage.getItem('hermes-webui-session')===session.session_id) localStorage.removeItem('hermes-webui-session'); }catch(_){ }
     showToast(session.archived?_sessionArchiveToast(response,session):t('session_restored'));
     if(renderHold) await renderHold;
     if(_showArchived&&!_sessionPrefersReducedMotion()) _sessionSwipeReturnOffsets.set(session.session_id,'0px');
