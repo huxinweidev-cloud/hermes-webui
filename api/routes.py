@@ -3094,6 +3094,62 @@ def _anchor_scene_message_text(message) -> str:
     return str(content or "")
 
 
+def _anchor_scene_content_text(part) -> str:
+    if part is None:
+        return ""
+    if isinstance(part, str):
+        return part
+    if not isinstance(part, dict):
+        return str(part or "")
+    return str(
+        part.get("text")
+        or part.get("content")
+        or part.get("input_text")
+        or part.get("output_text")
+        or part.get("thinking")
+        or part.get("reasoning")
+        or part.get("summary")
+        or ""
+    )
+
+
+def _anchor_scene_content_visible_text(part) -> str:
+    if part is None:
+        return ""
+    if isinstance(part, str):
+        return part
+    if not isinstance(part, dict):
+        return str(part or "")
+    part_type = str(part.get("type") or "")
+    if part_type in ("thinking", "reasoning"):
+        return ""
+    content_text = part.get("content") if part_type in ("text", "input_text", "output_text") else ""
+    return str(part.get("text") or part.get("input_text") or part.get("output_text") or content_text or "")
+
+
+def _anchor_scene_message_has_content_tool_use(message) -> bool:
+    content = message.get("content") if isinstance(message, dict) else None
+    return isinstance(content, list) and any(
+        isinstance(part, dict) and part.get("type") == "tool_use" for part in content
+    )
+
+
+def _anchor_scene_final_answer_text(message) -> str:
+    if not _anchor_scene_message_has_content_tool_use(message):
+        return _anchor_scene_message_text(message)
+    content = message.get("content") if isinstance(message, dict) else []
+    last_tool_index = -1
+    for idx, part in enumerate(content):
+        if isinstance(part, dict) and part.get("type") == "tool_use":
+            last_tool_index = idx
+    tail_text = "\n".join(
+        text
+        for text in (_anchor_scene_content_visible_text(part) for part in content[last_tool_index + 1 :])
+        if _anchor_scene_clean_text(text)
+    )
+    return tail_text if _anchor_scene_clean_text(tail_text) else ""
+
+
 def _anchor_scene_message_reasoning_text(message) -> str:
     if not isinstance(message, dict):
         return ""
@@ -3135,6 +3191,32 @@ def _anchor_scene_clean_text(value) -> str:
 
 def _anchor_scene_text_key(value) -> str:
     return _anchor_scene_clean_text(value).lower()
+
+
+_ANCHOR_SCENE_SETTLED_SNIPPET_CAP = 4000
+
+
+def _anchor_scene_string_payload(value) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    try:
+        return json.dumps(value)
+    except Exception:
+        return str(value)
+
+
+def _anchor_scene_is_bounded_tool_body_preview(settled, full) -> bool:
+    settled_text = _anchor_scene_string_payload(settled)
+    full_text = _anchor_scene_string_payload(full)
+    return bool(
+        settled_text
+        and full_text
+        and len(full_text) > len(settled_text)
+        and len(settled_text) >= _ANCHOR_SCENE_SETTLED_SNIPPET_CAP
+        and full_text.startswith(settled_text)
+    )
 
 
 def _anchor_scene_row_looks_like_final_answer(row_text_key: str, final_key: str) -> bool:
@@ -3242,6 +3324,40 @@ def _anchor_scene_tool_args(tool):
     return {}
 
 
+def _anchor_scene_content_tool(part):
+    if not isinstance(part, dict):
+        return {}
+    fn = part.get("function") if isinstance(part.get("function"), dict) else {}
+    tool_id = (
+        part.get("id")
+        or part.get("tid")
+        or part.get("tool_call_id")
+        or part.get("tool_use_id")
+        or part.get("call_id")
+    )
+    return {
+        "id": tool_id,
+        "tid": part.get("tid") or tool_id,
+        "tool_call_id": part.get("tool_call_id"),
+        "tool_use_id": part.get("tool_use_id"),
+        "call_id": part.get("call_id"),
+        "name": part.get("name") or part.get("tool_name") or fn.get("name") or "tool",
+        "tool_name": part.get("tool_name"),
+        "args": part.get("args"),
+        "input": part.get("input"),
+        "function": copy.deepcopy(part.get("function")) if isinstance(part.get("function"), dict) else None,
+        "command": part.get("command") or part.get("raw_command") or part.get("original_command") or part.get("display_command"),
+        "preview": part.get("preview") or part.get("summary"),
+        "snippet": part.get("snippet") or part.get("result") or part.get("output"),
+        "result": copy.deepcopy(part.get("result")),
+        "output": copy.deepcopy(part.get("output")),
+        "is_error": part.get("is_error"),
+        "error": part.get("error"),
+        "duration": part.get("duration"),
+        "started_at": part.get("started_at"),
+    }
+
+
 def _anchor_scene_row_base(role, kind, source_event_type, order_index, message_index, stream_id=""):
     return {
         "row_id": f"hydrated:{stream_id or 'stream'}:{role}:{message_index}:{order_index}",
@@ -3333,6 +3449,273 @@ def _anchor_scene_tool_row(tool, order_index, message_index, stream_id=""):
     return row
 
 
+def _anchor_scene_tool_row_id(row) -> str:
+    if not isinstance(row, dict):
+        return ""
+    tool = row.get("tool") if isinstance(row.get("tool"), dict) else {}
+    payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
+    return str(
+        row.get("tool_call_id")
+        or tool.get("id")
+        or tool.get("tid")
+        or tool.get("tool_call_id")
+        or tool.get("tool_use_id")
+        or tool.get("call_id")
+        or payload.get("tid")
+        or payload.get("id")
+        or ""
+    ).strip()
+
+
+def _anchor_scene_tool_row_name(row) -> str:
+    if not isinstance(row, dict):
+        return ""
+    tool = row.get("tool") if isinstance(row.get("tool"), dict) else {}
+    payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
+    return str(tool.get("name") or payload.get("name") or "tool").strip().lower()
+
+
+def _anchor_scene_tool_rows_have_compatible_names(existing, incoming) -> bool:
+    existing_name = _anchor_scene_tool_row_name(existing)
+    incoming_name = _anchor_scene_tool_row_name(incoming)
+    return (
+        not existing_name
+        or not incoming_name
+        or existing_name == "tool"
+        or incoming_name == "tool"
+        or existing_name == incoming_name
+    )
+
+
+def _anchor_scene_tool_row_args(row):
+    if not isinstance(row, dict):
+        return None
+    tool = row.get("tool") if isinstance(row.get("tool"), dict) else {}
+    payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
+    args = tool.get("args") if isinstance(tool.get("args"), dict) else payload.get("args")
+    return args if isinstance(args, dict) and args else None
+
+
+def _anchor_scene_object_contains_subset(base, subset) -> bool:
+    if not isinstance(base, dict) or not isinstance(subset, dict):
+        return False
+    for key, value in subset.items():
+        if key not in base:
+            return False
+        if json.dumps(base[key], sort_keys=True, separators=(",", ":")) != json.dumps(
+            value,
+            sort_keys=True,
+            separators=(",", ":"),
+        ):
+            return False
+    return True
+
+
+def _anchor_scene_tool_rows_have_compatible_invocation(existing, incoming) -> bool:
+    if not isinstance(existing, dict) or not isinstance(incoming, dict):
+        return False
+    existing_tool = existing.get("tool") if isinstance(existing.get("tool"), dict) else {}
+    incoming_tool = incoming.get("tool") if isinstance(incoming.get("tool"), dict) else {}
+    existing_payload = existing.get("payload") if isinstance(existing.get("payload"), dict) else {}
+    incoming_payload = incoming.get("payload") if isinstance(incoming.get("payload"), dict) else {}
+    existing_command = str(existing_tool.get("command") or existing_payload.get("command") or "").strip()
+    incoming_command = str(incoming_tool.get("command") or incoming_payload.get("command") or "").strip()
+    if existing_command and incoming_command:
+        return existing_command == incoming_command
+    existing_args = _anchor_scene_tool_row_args(existing)
+    incoming_args = _anchor_scene_tool_row_args(incoming)
+    if not existing_args or not incoming_args:
+        return False
+    return _anchor_scene_object_contains_subset(
+        existing_args,
+        incoming_args,
+    ) or _anchor_scene_object_contains_subset(incoming_args, existing_args)
+
+
+def _anchor_scene_tool_row_has_invocation_evidence(row) -> bool:
+    if not isinstance(row, dict):
+        return False
+    tool = row.get("tool") if isinstance(row.get("tool"), dict) else {}
+    payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
+    command = str(tool.get("command") or payload.get("command") or "").strip()
+    args = _anchor_scene_tool_row_args(row)
+    return bool(command or args)
+
+
+def _anchor_scene_tool_rows_can_name_match(existing, incoming) -> bool:
+    if not _anchor_scene_tool_rows_have_compatible_names(existing, incoming):
+        return False
+    if _anchor_scene_tool_row_has_invocation_evidence(existing) and _anchor_scene_tool_row_has_invocation_evidence(incoming):
+        return _anchor_scene_tool_rows_have_compatible_invocation(existing, incoming)
+    return True
+
+
+def _anchor_scene_tool_rows_have_different_explicit_ids(existing, incoming) -> bool:
+    existing_id = _anchor_scene_tool_row_id(existing)
+    incoming_id = _anchor_scene_tool_row_id(incoming)
+    return bool(existing_id and incoming_id and existing_id != incoming_id)
+
+
+def _anchor_scene_tool_row_started_at(row) -> str:
+    if not isinstance(row, dict):
+        return ""
+    tool = row.get("tool") if isinstance(row.get("tool"), dict) else {}
+    payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
+    value = tool.get("started_at")
+    if value is None or value == "":
+        value = payload.get("started_at")
+    return str(value) if value is not None and value != "" else ""
+
+
+def _anchor_scene_tool_rows_have_same_started_at(existing, incoming) -> bool:
+    existing_started_at = _anchor_scene_tool_row_started_at(existing)
+    incoming_started_at = _anchor_scene_tool_row_started_at(incoming)
+    return bool(existing_started_at and incoming_started_at and existing_started_at == incoming_started_at)
+
+
+def _anchor_scene_tool_row_body_text(row) -> str:
+    if not isinstance(row, dict):
+        return ""
+    tool = row.get("tool") if isinstance(row.get("tool"), dict) else {}
+    payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
+    for value in (
+        tool.get("snippet"),
+        payload.get("snippet"),
+        tool.get("output"),
+        payload.get("output"),
+        tool.get("result"),
+        payload.get("result"),
+        tool.get("preview"),
+        payload.get("preview"),
+    ):
+        text = str(value or "").strip()
+        if text:
+            return text
+    return ""
+
+
+def _anchor_scene_tool_rows_have_compatible_body(existing, incoming) -> bool:
+    existing_body = _anchor_scene_tool_row_body_text(existing)
+    incoming_body = _anchor_scene_tool_row_body_text(incoming)
+    return bool(
+        existing_body
+        and incoming_body
+        and (
+            existing_body == incoming_body
+            or existing_body.startswith(incoming_body)
+            or incoming_body.startswith(existing_body)
+        )
+    )
+
+
+def _anchor_scene_matching_content_tool_row_index(
+    rows,
+    content_tool_indexes,
+    incoming_row,
+    ordinal,
+    used_indexes,
+    incoming_total=0,
+    id_flexible_indexes=None,
+):
+    if not isinstance(rows, list) or not isinstance(content_tool_indexes, list) or not isinstance(incoming_row, dict):
+        return None
+    incoming_id = _anchor_scene_tool_row_id(incoming_row)
+    for index in content_tool_indexes:
+        if index in used_indexes or index < 0 or index >= len(rows):
+            continue
+        existing_id = _anchor_scene_tool_row_id(rows[index])
+        if existing_id and incoming_id and existing_id == incoming_id:
+            return index
+    if len(content_tool_indexes) == 1 and incoming_total == 1:
+        index = content_tool_indexes[0]
+        if (
+            index not in used_indexes
+            and 0 <= index < len(rows)
+            and _anchor_scene_tool_rows_can_name_match(rows[index], incoming_row)
+        ):
+            return index
+    available_indexes = [
+        index for index in content_tool_indexes if index not in used_indexes and 0 <= index < len(rows)
+    ]
+    if len(available_indexes) == 1:
+        index = available_indexes[0]
+        if incoming_total == 1 and _anchor_scene_tool_rows_can_name_match(rows[index], incoming_row):
+            return index
+        if _anchor_scene_tool_rows_have_compatible_names(
+            rows[index],
+            incoming_row,
+        ) and _anchor_scene_tool_rows_have_compatible_invocation(rows[index], incoming_row):
+            return index
+    reusable_indexes = [
+        index for index in content_tool_indexes if index in used_indexes and 0 <= index < len(rows)
+    ]
+    if len(reusable_indexes) == 1 and incoming_total == 1:
+        index = reusable_indexes[0]
+        existing_id = _anchor_scene_tool_row_id(rows[index])
+        id_flexible = isinstance(id_flexible_indexes, set) and index in id_flexible_indexes
+        if _anchor_scene_tool_rows_have_compatible_names(
+            rows[index],
+            incoming_row,
+        ) and (
+            (existing_id and incoming_id and existing_id == incoming_id)
+            or (
+                id_flexible
+                and _anchor_scene_tool_rows_have_same_started_at(rows[index], incoming_row)
+                and _anchor_scene_tool_rows_have_compatible_body(rows[index], incoming_row)
+            )
+        ) and _anchor_scene_tool_rows_have_compatible_invocation(rows[index], incoming_row):
+            return index
+    for index in content_tool_indexes:
+        if index in used_indexes or index < 0 or index >= len(rows):
+            continue
+        existing_id = _anchor_scene_tool_row_id(rows[index])
+        if not existing_id and not incoming_id and _anchor_scene_tool_rows_can_name_match(rows[index], incoming_row):
+            return index
+    return None
+
+
+def _anchor_scene_content_rows(message, order_index, message_index, stream_id="", *, is_final_message=False):
+    if not _anchor_scene_message_has_content_tool_use(message):
+        return None
+    rows = []
+    content = message.get("content") if isinstance(message, dict) else []
+    last_tool_index = -1
+    for idx, part in enumerate(content):
+        if isinstance(part, dict) and part.get("type") == "tool_use":
+            last_tool_index = idx
+    for idx, part in enumerate(content):
+        if not isinstance(part, dict):
+            if is_final_message and idx > last_tool_index:
+                continue
+            text = _anchor_scene_content_text(part)
+            if _anchor_scene_clean_text(text):
+                rows.append(_anchor_scene_prose_row(text, order_index + len(rows), message_index, stream_id))
+            continue
+        part_type = part.get("type")
+        if part_type in ("text", "input_text", "output_text"):
+            if is_final_message and idx > last_tool_index and _anchor_scene_content_visible_text(part):
+                continue
+            text = _anchor_scene_content_text(part)
+            if _anchor_scene_clean_text(text):
+                rows.append(_anchor_scene_prose_row(text, order_index + len(rows), message_index, stream_id))
+            continue
+        if part_type in ("thinking", "reasoning"):
+            text = _anchor_scene_content_text(part)
+            if _anchor_scene_clean_text(text):
+                rows.append(_anchor_scene_thinking_row(text, order_index + len(rows), message_index, stream_id))
+            continue
+        if part_type == "tool_use":
+            rows.append(
+                _anchor_scene_tool_row(
+                    _anchor_scene_content_tool(part),
+                    order_index + len(rows),
+                    message_index,
+                    stream_id,
+                )
+            )
+    return rows
+
+
 def _anchor_scene_row_key(row) -> str:
     if not isinstance(row, dict):
         return ""
@@ -3398,12 +3781,76 @@ def _complete_hydrated_anchor_scene(messages, scene, message_index, *, message_o
         if isinstance(message, dict) and message.get("role") == "user":
             turn_start = idx
             break
-    final_answer = _anchor_scene_message_text(final_message)
+    message_final_answer = _anchor_scene_final_answer_text(final_message)
+    scene_final_answer = scene.get("final_answer") if isinstance(scene.get("final_answer"), str) else ""
+    final_answer = message_final_answer if _anchor_scene_clean_text(message_final_answer) else scene_final_answer
     final_key = _anchor_scene_text_key(final_answer)
     rows = []
     seen = {}
 
-    def push(row):
+    def merge_duplicate_tool_row(existing, incoming, *, prefer_incoming_body=False):
+        if not isinstance(existing, dict) or not isinstance(incoming, dict):
+            return existing
+        merged = copy.deepcopy(existing)
+        merged_tool = merged.get("tool") if isinstance(merged.get("tool"), dict) else {}
+        incoming_tool = incoming.get("tool") if isinstance(incoming.get("tool"), dict) else {}
+        merged_payload = merged.get("payload") if isinstance(merged.get("payload"), dict) else {}
+        incoming_payload = incoming.get("payload") if isinstance(incoming.get("payload"), dict) else {}
+
+        def empty(value):
+            return value is None or value == "" or value == {}
+
+        def merge_missing_args(existing_args, incoming_args):
+            if not isinstance(incoming_args, dict) or not incoming_args:
+                return existing_args, False
+            base = copy.deepcopy(existing_args) if isinstance(existing_args, dict) else {}
+            changed = not isinstance(existing_args, dict)
+            for key, value in incoming_args.items():
+                if key not in base:
+                    base[key] = copy.deepcopy(value)
+                    changed = True
+            return base, changed
+
+        for key in ("snippet", "result", "output"):
+            incoming_value = incoming_tool.get(key)
+            if not empty(incoming_value) and (
+                empty(merged_tool.get(key))
+                or (
+                    prefer_incoming_body
+                    and _anchor_scene_is_bounded_tool_body_preview(merged_tool.get(key), incoming_value)
+                )
+            ):
+                merged_tool[key] = copy.deepcopy(incoming_value)
+            incoming_value = incoming_payload.get(key)
+            if not empty(incoming_value) and (
+                empty(merged_payload.get(key))
+                or (
+                    prefer_incoming_body
+                    and _anchor_scene_is_bounded_tool_body_preview(merged_payload.get(key), incoming_value)
+                )
+            ):
+                merged_payload[key] = copy.deepcopy(incoming_value)
+        for key in ("preview", "command", "duration", "started_at"):
+            incoming_value = incoming_tool.get(key)
+            if not empty(incoming_value) and empty(merged_tool.get(key)):
+                merged_tool[key] = copy.deepcopy(incoming_value)
+            incoming_value = incoming_payload.get(key)
+            if not empty(incoming_value) and empty(merged_payload.get(key)):
+                merged_payload[key] = copy.deepcopy(incoming_value)
+        merged_args, args_changed = merge_missing_args(merged_tool.get("args"), incoming_tool.get("args"))
+        if args_changed:
+            merged_tool["args"] = merged_args
+        merged_payload_args, payload_args_changed = merge_missing_args(
+            merged_payload.get("args"),
+            incoming_payload.get("args"),
+        )
+        if payload_args_changed:
+            merged_payload["args"] = merged_payload_args
+        merged["tool"] = merged_tool
+        merged["payload"] = merged_payload
+        return merged
+
+    def push(row, *, prefer_incoming_tool_body=False):
         if not isinstance(row, dict):
             return
         row = _anchor_scene_settle_live_running_row(
@@ -3419,6 +3866,14 @@ def _complete_hydrated_anchor_scene(messages, scene, message_index, *, message_o
             return
         key = _anchor_scene_row_key(row)
         if key and key in seen:
+            if key.startswith("tool:"):
+                index = seen[key]
+                rows[index] = merge_duplicate_tool_row(
+                    rows[index],
+                    row,
+                    prefer_incoming_body=prefer_incoming_tool_body,
+                )
+                return
             if key == "lifecycle:compression":
                 index = seen[key]
                 next_row = copy.deepcopy(row)
@@ -3434,13 +3889,37 @@ def _complete_hydrated_anchor_scene(messages, scene, message_index, *, message_o
         rows.append(next_row)
 
     order = 0
-    for local_idx in range(turn_start + 1, local_final_idx):
+    content_tool_indexes_by_idx = {}
+    used_content_tool_indexes_by_idx = {}
+    id_flexible_content_tool_indexes_by_idx = {}
+    for local_idx in range(turn_start + 1, local_final_idx + 1):
         message = messages[local_idx]
         if not isinstance(message, dict) or message.get("role") != "assistant":
             continue
         absolute_idx = int(message_offset or 0) + local_idx
         text = _anchor_scene_message_text(message)
-        if _anchor_scene_clean_text(text):
+        content_rows = _anchor_scene_content_rows(
+            message,
+            order,
+            absolute_idx,
+            stream_id,
+            is_final_message=local_idx == local_final_idx,
+        )
+        content_tool_indexes = []
+        used_content_tool_indexes = set()
+        id_flexible_content_tool_indexes = set()
+        if content_rows:
+            for row in content_rows:
+                previous_len = len(rows)
+                push(row)
+                if row.get("role") == "tool" and len(rows) > previous_len:
+                    content_tool_indexes.append(len(rows) - 1)
+                order += 1
+            if content_tool_indexes:
+                content_tool_indexes_by_idx[absolute_idx] = content_tool_indexes
+                used_content_tool_indexes_by_idx[absolute_idx] = used_content_tool_indexes
+                id_flexible_content_tool_indexes_by_idx[absolute_idx] = id_flexible_content_tool_indexes
+        elif _anchor_scene_clean_text(text):
             push(_anchor_scene_prose_row(text, order, absolute_idx, stream_id))
             order += 1
         reasoning = _anchor_scene_message_reasoning_text(message)
@@ -3450,9 +3929,42 @@ def _complete_hydrated_anchor_scene(messages, scene, message_index, *, message_o
         for key in ("tool_calls", "_partial_tool_calls"):
             calls = message.get(key)
             if isinstance(calls, list):
-                for call in calls:
-                    push(_anchor_scene_tool_row(call, order, absolute_idx, stream_id))
+                for tool_ordinal, call in enumerate(calls):
+                    row = _anchor_scene_tool_row(call, order, absolute_idx, stream_id)
+                    content_match_index = _anchor_scene_matching_content_tool_row_index(
+                        rows,
+                        content_tool_indexes,
+                        row,
+                        tool_ordinal,
+                        used_content_tool_indexes,
+                        len(calls),
+                        id_flexible_content_tool_indexes,
+                    )
+                    if content_match_index is not None:
+                        if _anchor_scene_tool_rows_have_different_explicit_ids(
+                            rows[content_match_index],
+                            row,
+                        ):
+                            id_flexible_content_tool_indexes.add(content_match_index)
+                        rows[content_match_index] = merge_duplicate_tool_row(rows[content_match_index], row)
+                        incoming_key = _anchor_scene_row_key(row)
+                        if incoming_key:
+                            seen[incoming_key] = content_match_index
+                        used_content_tool_indexes.add(content_match_index)
+                        order += 1
+                        continue
+                    push(row)
                     order += 1
+    external_tool_counts = {}
+    for call in tool_calls or []:
+        if not isinstance(call, dict):
+            continue
+        try:
+            absolute_idx = int(call.get("assistant_msg_idx"))
+        except (TypeError, ValueError):
+            continue
+        external_tool_counts[absolute_idx] = external_tool_counts.get(absolute_idx, 0) + 1
+    external_tool_ordinals = {}
     for call in tool_calls or []:
         if not isinstance(call, dict):
             continue
@@ -3461,9 +3973,35 @@ def _complete_hydrated_anchor_scene(messages, scene, message_index, *, message_o
         except (TypeError, ValueError):
             continue
         local_idx = absolute_idx - int(message_offset or 0)
-        if not (turn_start < local_idx < local_final_idx):
+        if not (turn_start < local_idx <= local_final_idx):
             continue
-        push(_anchor_scene_tool_row(call, order, absolute_idx, stream_id))
+        row = _anchor_scene_tool_row(call, order, absolute_idx, stream_id)
+        tool_ordinal = external_tool_ordinals.get(absolute_idx, 0)
+        external_tool_ordinals[absolute_idx] = tool_ordinal + 1
+        content_match_index = _anchor_scene_matching_content_tool_row_index(
+            rows,
+            content_tool_indexes_by_idx.get(absolute_idx, []),
+            row,
+            tool_ordinal,
+            used_content_tool_indexes_by_idx.setdefault(absolute_idx, set()),
+            external_tool_counts.get(absolute_idx, 0),
+            id_flexible_content_tool_indexes_by_idx.setdefault(absolute_idx, set()),
+        )
+        if content_match_index is not None:
+            if _anchor_scene_tool_rows_have_different_explicit_ids(rows[content_match_index], row):
+                id_flexible_content_tool_indexes_by_idx.setdefault(absolute_idx, set()).add(content_match_index)
+            rows[content_match_index] = merge_duplicate_tool_row(
+                rows[content_match_index],
+                row,
+                prefer_incoming_body=True,
+            )
+            incoming_key = _anchor_scene_row_key(row)
+            if incoming_key:
+                seen[incoming_key] = content_match_index
+            used_content_tool_indexes_by_idx[absolute_idx].add(content_match_index)
+            order += 1
+            continue
+        push(row, prefer_incoming_tool_body=True)
         order += 1
     for row in scene.get("activity_rows") or []:
         if isinstance(row, dict) and row.get("role") != "terminal":
@@ -6673,6 +7211,7 @@ from api.route_approvals import (  # noqa: F401 — re-exports for backward comp
     _approval_sse_notify_locked,
     _approval_sse_notify,
     _GATEWAY_MIRROR_FLAG,
+    _gateway_mirrored_pending_run_id,
     reconcile_gateway_pending_mirror_locked,
     submit_gateway_pending_mirror,
     submit_pending,
@@ -9200,6 +9739,16 @@ def handle_get(handler, parsed) -> bool:
         settings = load_settings()
         # Never expose the stored password hash to clients
         settings.pop("password_hash", None)
+        settings.setdefault("max_tokens", None)
+        settings.setdefault("max_tokens_effective", None)
+        settings.setdefault("max_tokens_fallback", None)
+        try:
+            from api.config import get_max_tokens_status
+            settings.update(get_max_tokens_status())
+        except Exception:
+            settings["max_tokens"] = None
+            settings["max_tokens_effective"] = None
+            settings["max_tokens_fallback"] = None
         # Surface env-var precedence so the UI can disable the password field
         # instead of silently no-oping the save (#1560). The setting takes
         # precedence in api.auth.get_password_hash(), but until now the UI
@@ -9962,6 +10511,13 @@ def handle_get(handler, parsed) -> bool:
     if parsed.path == "/api/commands/bundles":
         from api.commands import list_command_bundles
         return j(handler, {"bundles": list_command_bundles()})
+
+    if parsed.path == "/api/commands/moa/resolve":
+        from api.commands import resolve_moa_config
+        try:
+            return j(handler, resolve_moa_config())
+        except RuntimeError as e:
+            return bad(handler, str(e), 503)
 
     if parsed.path == "/api/updates/check":
         settings = load_settings()
@@ -11905,6 +12461,10 @@ def handle_post(handler, parsed) -> bool:
                     409,
                 )
 
+        max_tokens_provided = "max_tokens" in body
+        max_tokens_status = None
+        max_tokens_value = body.pop("max_tokens", None) if max_tokens_provided else None
+
         # First password creation decides who owns a previously passwordless
         # WebUI. While auth is disabled, the generic /api/settings route is also
         # unauthenticated, so gate bootstrap password setup the same way as
@@ -11955,8 +12515,13 @@ def handle_post(handler, parsed) -> bool:
         elif is_auth_enabled() or requested_password:
             body["auth_disabled_acknowledged"] = False
 
+        from api.config import get_max_tokens_status, set_max_tokens
+
         saved = save_settings(body)
+        if max_tokens_provided:
+            max_tokens_status = set_max_tokens(max_tokens_value)
         saved.pop("password_hash", None)  # never expose hash to client
+        saved.update(max_tokens_status if max_tokens_provided else get_max_tokens_status())
 
         # Settings that change which sessions appear in the sidebar must
         # invalidate the session-list cache directly. Relying on the cache's
@@ -16328,6 +16893,7 @@ def _start_chat_stream_for_session(
     diag=None,
     goal_related: bool = False,
     source: str = "webui",
+    moa_config=None,
 ):
     """Persist pending state, register an SSE channel, and start an agent turn."""
     attachments = attachments or []
@@ -16452,6 +17018,8 @@ def _start_chat_stream_for_session(
     worker_kwargs = {"model_provider": model_provider}
     if not backend_is_gateway:
         worker_kwargs["goal_related"] = goal_related
+    if moa_config and not backend_is_gateway:
+        worker_kwargs["moa_config"] = moa_config
     thr = threading.Thread(
         target=worker_target,
         args=(s.session_id, msg, model, workspace, stream_id, attachments),
@@ -16537,6 +17105,7 @@ def _start_run(
     source: str,
     route: str,
     diag=None,
+    moa_config=None,
 ):
     """Shared start-run helper for /api/chat/start and start_session_turn.
 
@@ -16576,6 +17145,7 @@ def _start_run(
                 normalized_model=normalized_model,
                 diag=diag,
                 source=request.source or source,
+                moa_config=moa_config,
             )
 
         def _legacy_adapter_factory():
@@ -16615,6 +17185,7 @@ def _start_run(
         normalized_model=normalized_model,
         diag=diag,
         source=source,
+        moa_config=moa_config,
     )
 
 
@@ -16984,6 +17555,16 @@ def _handle_chat_start(handler, body, diag=None):
         )
         _pp_provider, _pp_default = _read_profile_model_config(s, requested_provider)
         explicit_model_pick = bool(body.get("explicit_model_pick"))
+        moa_config = None
+        if body.get("moa_config"):
+            if webui_gateway_chat_enabled(get_config()):
+                return bad(handler, "MoA override is unavailable on gateway-backed sessions", 409)
+            from api.commands import resolve_moa_config
+
+            try:
+                moa_config = resolve_moa_config()
+            except RuntimeError as e:
+                return bad(handler, str(e), 503)
         diag.stage("resolve_model_provider") if diag else None
         model, model_provider, normalized_model = _resolve_compatible_session_model_state(
             requested_model,
@@ -17007,6 +17588,7 @@ def _handle_chat_start(handler, body, diag=None):
             source="webui",
             route="/api/chat/start",
             diag=diag,
+            moa_config=moa_config,
         )
         # Map adapter-selection NotImplementedError (501) onto the legacy
         # bad-request response shape that this route exposed historically
@@ -18553,7 +19135,9 @@ def _handle_approval_respond(handler, body):
         return bad(handler, f"Invalid choice: {choice}")
     approval_id = body.get("approval_id", "")
 
-    # Gateway relay: forward choice to the runs API when session has an active run.
+    # Gateway relay: forward choice to the runs API when session has an active run,
+    # or recover the run_id from the mirrored gateway approval entry if the
+    # stream pointer has already been cleared.
     try:
         from api.gateway_chat import (
             _STREAM_RUN_IDS,
@@ -18568,6 +19152,8 @@ def _handle_approval_respond(handler, body):
             active_sid = getattr(s, "active_stream_id", None)
             if active_sid:
                 _run_id = _STREAM_RUN_IDS.get(active_sid)
+            if not _run_id and approval_id:
+                _run_id = _gateway_mirrored_pending_run_id(sid, approval_id)
         if _run_id:
             if not approval_id:
                 return bad(handler, "approval_id is required for gateway approvals")
@@ -18579,21 +19165,13 @@ def _handle_approval_respond(handler, body):
                 HttpRunnerClient(base_url=_base, api_key=_key).respond_approval(_run_id, approval_id, choice)
             except (RunnerClientError, ValueError) as exc:
                 return j(handler, {"ok": False, "choice": choice, "relayed": True, "error": str(exc)}, status=502)
+            # The outbound relay only resumes the remote run; the local mirror
+            # still needs the same cleanup path so the parked entry, mirrored
+            # card, and agent signal all settle here too.
+            _resolve_approval_legacy(sid, approval_id, choice)
             return j(handler, {"ok": True, "choice": choice, "relayed": True})
-        # #4771 surfaces an explicit relay-failure 409 when a gateway approval
-        # is pending but its run is gone (so the card stays actionable instead
-        # of silently failing). That signal is ONLY meaningful on a
-        # gateway-backed deployment. On the default local in-process backend,
-        # every guarded command parks an entry in tools.approval._gateway_queues
-        # (via _await_gateway_decision), which the WebUI mirrors into _pending
-        # with _GATEWAY_MIRROR_FLAG set — but there is no gateway run and no
-        # _STREAM_RUN_IDS entry by design. Without the backend-mode gate below,
-        # _gateway_pending_approval_without_run_id() returns True for that purely
-        # local approval and the handler 409s ("active run unavailable"),
-        # refusing to resolve an approval that resolves perfectly well locally.
-        # Gate on gateway mode so local approvals fall through to the local
-        # resolution path; gateway behaviour is unchanged. (#4771 regression;
-        # also reported as #4948)
+        # Only a still-mirrored gateway approval with a missing run should 409;
+        # stale or empty gateway clicks fall through to local resolution.
         if webui_gateway_chat_enabled(_get_config()) and _gateway_pending_approval_without_run_id(
             sid, approval_id
         ):
@@ -19122,7 +19700,12 @@ def _handle_session_compress(handler, body):
             if _sanitize_messages_for_api(s.messages) != original_messages:
                 return bad(handler, "Session was modified during compression; please retry.", 409)
 
-            s.context_messages = copy.deepcopy(compressed)
+            from api.session_ops import _truncation_watermark_for
+            from api.streaming import _stamp_missing_message_timestamps
+
+            compressed_copy = copy.deepcopy(compressed)
+            _stamp_missing_message_timestamps(compressed_copy)
+            s.context_messages = compressed_copy
             s.active_stream_id = None
             s.pending_user_message = None
             s.pending_attachments = []
@@ -19137,7 +19720,19 @@ def _handle_session_compress(handler, body):
             s.compression_anchor_summary = _compact_summary_text(
                 summary_text or _compression_summary_from_messages(compressed) or ""
             )
+            # Persist an intentional-shrink boundary so append-only state.db
+            # reconciliation does not replay pre-compression rows (#4836).
+            compress_watermark = _truncation_watermark_for(compressed_copy)
+            s.truncation_watermark = compress_watermark
+            s.truncation_boundary = compress_watermark
+            s.compression_anchor_mode = "manual"
+            s.last_prompt_tokens = new_tokens
             s.save()
+            # Drop stale backups that would undo an intentional manual compress.
+            try:
+                s.path.with_suffix(".json.bak").unlink(missing_ok=True)
+            except OSError:
+                pass
 
         session_payload = redact_session_data(
             s.compact() | {
