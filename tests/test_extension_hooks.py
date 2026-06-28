@@ -154,7 +154,7 @@ def test_extension_settings_runtime_config_injects_before_extension_scripts(tmp_
     injected = inject_extension_tags("<html><head></head><body></body></html>")
 
     assert "window.__HERMES_EXTENSION_CONFIG__" in injected
-    assert "window.HermesExtensionSettings.configure(window.__HERMES_EXTENSION_CONFIG__)" in injected
+    assert "window.HermesExtensionSettings.primeFromStatus(window.__HERMES_EXTENSION_CONFIG__)" in injected
     assert '"storage_owned":true' in injected
     assert '"settings_schema":[{"key":"flag","type":"boolean"' in injected
     assert injected.index("window.__HERMES_EXTENSION_CONFIG__") < injected.index("/extensions/settings-ok.js")

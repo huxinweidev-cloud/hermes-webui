@@ -7,6 +7,7 @@ It is disabled by default and never executes or fetches third-party URLs.
 
 import html
 import json
+import math
 import logging
 import os
 import re
@@ -559,26 +560,32 @@ def _normalize_enum_options(options: object) -> Optional[List[Dict[str, str]]]:
         normalized.append({"value": value, "label": label})
     return normalized
 
+_SETTINGS_DEFAULT_MISSING = object()
+
 def _normalize_settings_default(field_type: str, raw_default: object, options: Optional[List[Dict[str, str]]] = None) -> Tuple[bool, object]:
     if field_type == "boolean":
-        if raw_default is None:
+        if raw_default is _SETTINGS_DEFAULT_MISSING:
             return True, False
         return (True, raw_default) if isinstance(raw_default, bool) else (False, None)
     if field_type == "string":
-        if raw_default is None:
+        if raw_default is _SETTINGS_DEFAULT_MISSING:
             return True, ""
         return (True, raw_default) if isinstance(raw_default, str) else (False, None)
     if field_type == "number":
-        if raw_default is None:
+        if raw_default is _SETTINGS_DEFAULT_MISSING:
             return True, 0
-        return (True, raw_default) if isinstance(raw_default, (int, float)) and not isinstance(raw_default, bool) else (False, None)
+        return (
+            (True, raw_default)
+            if isinstance(raw_default, (int, float)) and not isinstance(raw_default, bool) and math.isfinite(raw_default)
+            else (False, None)
+        )
     if field_type == "integer":
-        if raw_default is None:
+        if raw_default is _SETTINGS_DEFAULT_MISSING:
             return True, 0
         return (True, raw_default) if isinstance(raw_default, int) and not isinstance(raw_default, bool) else (False, None)
     if field_type == "enum" and options:
         values = [option["value"] for option in options]
-        if raw_default is None:
+        if raw_default is _SETTINGS_DEFAULT_MISSING:
             return True, values[0]
         return (True, raw_default) if isinstance(raw_default, str) and raw_default in values else (False, None)
     return False, None
@@ -615,7 +622,7 @@ def _sanitize_settings_schema(entry: Dict[str, object]) -> List[Dict[str, object
         options = _normalize_enum_options(raw_field.get("options")) if field_type == "enum" else None
         if field_type == "enum" and options is None:
             continue
-        ok, default = _normalize_settings_default(field_type, raw_field.get("default"), options)
+        ok, default = _normalize_settings_default(field_type, raw_field.get("default", _SETTINGS_DEFAULT_MISSING), options)
         if not ok:
             continue
         if key in seen_keys:
@@ -1545,7 +1552,7 @@ def inject_extension_tags(index_html: str) -> str:
     runtime_json = json.dumps(runtime_config, ensure_ascii=False, separators=(",", ":")).replace("<", "\\u003c")
     runtime_tag = (
         "<script>window.__HERMES_EXTENSION_CONFIG__={};"
-        "if(window.HermesExtensionSettings)window.HermesExtensionSettings.configure(window.__HERMES_EXTENSION_CONFIG__);"
+        "if(window.HermesExtensionSettings)window.HermesExtensionSettings.primeFromStatus(window.__HERMES_EXTENSION_CONFIG__);"
         "</script>"
     ).format(runtime_json)
 

@@ -42,7 +42,7 @@ def test_extension_settings_runtime_normalizes_persists_resets_and_clears():
         }};
         eval(fs.readFileSync({str(EXTENSION_SETTINGS_JS)!r}, 'utf8'));
 
-        window.HermesExtensionSettings.configure({{
+        window.HermesExtensionSettings.primeFromStatus({{
           extensions: [{{
             id: 'demo.ext',
             name: 'Demo',
@@ -75,6 +75,23 @@ def test_extension_settings_runtime_normalizes_persists_resets_and_clears():
         assert.strictEqual(store.has('hermes.ext.settings.demo.ext'), false);
         assert.strictEqual(storage.clear(), true);
         assert.strictEqual(store.has('hermes.ext.storage.demo.ext'), false);
+
+        window.HermesExtensionSettings.primeFromStatus({{
+          extensions: [{{
+            id: 'denied.ext',
+            name: 'Denied',
+            storage_owned: false,
+            settings_schema: [{{key: 'flag', type: 'boolean', default: false}}],
+          }}]
+        }});
+
+        const deniedSettings = window.HermesExtensionSettings.settingsForExtension('denied.ext');
+        assert.strictEqual(deniedSettings.setAll({{flag: true}}).ok, false);
+        assert.strictEqual(store.has('hermes.ext.settings.denied.ext'), false);
+
+        const deniedStorage = window.HermesExtensionSettings.storageForExtension('denied.ext');
+        assert.strictEqual(deniedStorage.set('note', 'blocked'), false);
+        assert.strictEqual(store.has('hermes.ext.storage.denied.ext'), false);
         """
     )
     _run_node(script)

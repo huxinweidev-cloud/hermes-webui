@@ -223,6 +223,8 @@ def test_extension_status_sanitizes_settings_schema_only_for_owned_storage(tmp_p
                             {"key": "bad_enum", "type": "enum", "options": [{"label": "No value"}]},
                             {"key": "flag", "type": "boolean", "default": False},
                             {"key": "bad_default", "type": "integer", "default": 1.2},
+                            {"key": "null_flag", "type": "boolean", "default": None},
+                            {"key": "null_name", "type": "string", "default": None},
                         ],
                     },
                     {
@@ -243,13 +245,7 @@ def test_extension_status_sanitizes_settings_schema_only_for_owned_storage(tmp_p
     status = get_extension_status()
     by_id = {entry["id"]: entry for entry in status["extensions"]}
     assert by_id["settings-ok"]["storage_owned"] is True
-    assert [field["key"] for field in by_id["settings-ok"]["settings_schema"]] == [
-        "flag",
-        "name",
-        "ratio",
-        "count",
-        "mode",
-    ]
+    assert [field["key"] for field in by_id["settings-ok"]["settings_schema"]] == ["flag", "name", "ratio", "count", "mode"]
     assert by_id["settings-ok"]["settings_schema"][0]["default"] is True
     assert by_id["settings-ok"]["settings_schema"][4]["options"] == [
         {"value": "compact", "label": "Compact"},

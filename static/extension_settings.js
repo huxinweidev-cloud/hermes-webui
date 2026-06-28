@@ -97,18 +97,27 @@
     return fields;
   }
 
-  function configure(config){
-    const list=Array.isArray(config&&config.extensions)?config.extensions:[];
-    schemas.clear();
+  function normalizeSchemas(rawRows){
+    const list=Array.isArray(rawRows)?rawRows:[];
+    const entries=[];
     for(const entry of list){
       const id=extensionId(entry&&entry.id);
       if(!id) continue;
-      schemas.set(id, {
+      const storageOwned=!!(entry&&entry.storage_owned);
+      entries.push({
         id,
         name:text(entry&&entry.name,id),
-        storage_owned:!!(entry&&entry.storage_owned),
-        settings_schema:normalizeSchema(entry&&entry.settings_schema),
+        storage_owned:storageOwned,
+        settings_schema:storageOwned?normalizeSchema(entry&&entry.settings_schema):[],
       });
+    }
+    return entries;
+  }
+
+  function primeFromStatus(statusPayload){
+    schemas.clear();
+    for(const entry of normalizeSchemas(statusPayload&&statusPayload.extensions)){
+      schemas.set(entry.id,entry);
     }
   }
 
@@ -179,15 +188,20 @@
     return overrides;
   }
 
+  function supportsSettings(meta){
+    return !!(meta&&meta.storage_owned&&Array.isArray(meta.settings_schema)&&meta.settings_schema.length);
+  }
+
   function settingsForExtension(id){
     const clean=extensionId(id);
     const meta=schemas.get(clean)||{id:clean,name:clean,storage_owned:false,settings_schema:[]};
-    const schema=meta.settings_schema||[];
+    const schema=supportsSettings(meta)?meta.settings_schema:[];
     const key=settingsKey(clean);
     function current(){
       return validate(schema,safeRead(key)).values;
     }
     function setAll(values){
+      if(!supportsSettings(meta)) return {ok:false,values:current(),errors:{extension:'unsupported'}};
       const checked=validate(schema,values);
       if(!checked.ok) return checked;
       const saved=safeWrite(key,overridesFromValues(schema,checked.values));
@@ -209,10 +223,12 @@
       },
       setAll,
       reset(){
+        if(!supportsSettings(meta)) return current();
         safeWrite(key,{});
         return current();
       },
       clear(){
+        if(!supportsSettings(meta)) return false;
         safeWrite(key,{});
         return true;
       },
@@ -220,24 +236,31 @@
   }
 
   function storageForExtension(id){
-    const key=storageKey(id);
+    const clean=extensionId(id);
+    const meta=schemas.get(clean)||{id:clean,name:clean,storage_owned:false,settings_schema:[]};
+    const allowed=!!meta.storage_owned;
+    const key=storageKey(clean);
     return {
-      getAll(){return safeRead(key);},
+      getAll(){return allowed?safeRead(key):{};},
       get(name,defaultValue){
+        if(!allowed) return defaultValue;
         const data=safeRead(key);
         return Object.prototype.hasOwnProperty.call(data,name)?data[name]:defaultValue;
       },
       set(name,value){
+        if(!allowed) return false;
         const data=safeRead(key);
         data[name]=value;
         return safeWrite(key,data);
       },
       remove(name){
+        if(!allowed) return false;
         const data=safeRead(key);
         delete data[name];
         return safeWrite(key,data);
       },
       clear(){
+        if(!allowed) return false;
         safeWrite(key,{});
         return true;
       },
@@ -245,8 +268,8 @@
   }
 
   const api={
-    configure,
-    normalizeSchema,
+    normalizeSchemas,
+    primeFromStatus,
     namespaceForExtension,
     settingsForExtension,
     storageForExtension,
@@ -260,5 +283,5 @@
   window.hermesExt.storage=window.hermesExt.storage||{};
   window.hermesExt.settings.forExtension=settingsForExtension;
   window.hermesExt.storage.forExtension=storageForExtension;
-  configure(window.__HERMES_EXTENSION_CONFIG__||{});
+  primeFromStatus(window.__HERMES_EXTENSION_CONFIG__||{});
 })();

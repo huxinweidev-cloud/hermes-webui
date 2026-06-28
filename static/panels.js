@@ -8170,7 +8170,7 @@ function _extensionEntryBadge(entry){
 
 function _configureExtensionSettingsFromStatus(data){
   if(!window.HermesExtensionSettings||!data||!Array.isArray(data.extensions)) return;
-  window.HermesExtensionSettings.configure({extensions:data.extensions});
+  window.HermesExtensionSettings.primeFromStatus({extensions:data.extensions});
 }
 
 function _extensionSettingsFieldHtml(field,value){
