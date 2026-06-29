@@ -3982,6 +3982,7 @@ function _bucketDailyTokensForChart(rows) {
     const slice = rows.slice(i, i + bucketSize);
     const input_tokens = slice.reduce((s, r) => s + Number(r.input_tokens || 0), 0);
     const output_tokens = slice.reduce((s, r) => s + Number(r.output_tokens || 0), 0);
+    const cache_read_tokens = slice.reduce((s, r) => s + Number(r.cache_read_tokens || 0), 0);
     const sessions = slice.reduce((s, r) => s + Number(r.sessions || 0), 0);
     const cost = slice.reduce((s, r) => s + Number(r.cost || 0), 0);
 
@@ -3999,6 +4000,7 @@ function _bucketDailyTokensForChart(rows) {
       date: firstDate,
       input_tokens,
       output_tokens,
+      cache_read_tokens,
       sessions,
       cost,
     });
@@ -4059,7 +4061,13 @@ function _renderInsights(d, box, wikiStatus, skillUsage) {
         const outputPct = Math.max((output / maxDailyTokens) * 100, output ? 2 : 0).toFixed(1);
         const showLabel = idx === 0 || idx === chartRows.length - 1 || idx % labelEvery === 0;
         const titleDate = r.title || r.date;
-        const title = `${titleDate} · ${fmtTokens(input)} ${t('insights_input_tokens')} · ${fmtTokens(output)} ${t('insights_output_tokens')} · ${fmtCost(r.cost)} · ${fmtNum(r.sessions)} ${t('insights_sessions')}`;
+        const cacheRead = Number(r.cache_read_tokens || 0);
+        // Bounded daily cache hit rate: reads / (input + reads), 0-100%.
+        const cacheDenom = input + cacheRead;
+        const cacheStr = (cacheRead > 0 && cacheDenom > 0)
+          ? ` · ${Math.min(100, Math.round((cacheRead / cacheDenom) * 100))}% ${t('insights_model_cache')}`
+          : '';
+        const title = `${titleDate} · ${fmtTokens(input)} ${t('insights_input_tokens')} · ${fmtTokens(output)} ${t('insights_output_tokens')}${cacheStr} · ${fmtCost(r.cost)} · ${fmtNum(r.sessions)} ${t('insights_sessions')}`;
         const labelText = r.label !== undefined ? r.label : String(r.date).slice(5);
         return `<div class="insights-daily-bar" title="${esc(title)}"><div class="insights-daily-stack" aria-label="${esc(title)}"><div class="insights-daily-bar-output" style="height:${outputPct}%"></div><div class="insights-daily-bar-input" style="height:${inputPct}%"></div></div><span>${showLabel ? esc(labelText) : ''}</span></div>`;
       }).join('') +
@@ -4071,11 +4079,15 @@ function _renderInsights(d, box, wikiStatus, skillUsage) {
   // Models table
   let modelsHtml = '';
   if (d.models && d.models.length) {
-    modelsHtml = `<div class="insights-card"><div class="insights-card-title">${esc(t('insights_models'))}</div><div class="insights-table insights-model-table"><div class="insights-table-head"><span>${esc(t('insights_model_name'))}</span><span>${esc(t('insights_model_sessions'))}</span><span>${esc(t('insights_model_tokens'))}</span><span>${esc(t('insights_model_cost'))}</span><span>${esc(t('insights_model_share'))}</span></div>` +
+    modelsHtml = `<div class="insights-card"><div class="insights-card-title">${esc(t('insights_models'))}</div><div class="insights-table insights-model-table"><div class="insights-table-head"><span>${esc(t('insights_model_name'))}</span><span>${esc(t('insights_model_sessions'))}</span><span>${esc(t('insights_model_tokens'))}</span><span title="${esc(t('insights_cache_hit'))}">${esc(t('insights_model_cache'))}</span><span>${esc(t('insights_model_cost'))}</span><span>${esc(t('insights_model_share'))}</span></div>` +
       d.models.map(m => {
         const share = Number(m.cost_share || m.token_share || m.session_share || 0);
         const title = `${m.model} · ${fmtTokens(m.input_tokens)} ${t('insights_input_tokens')} · ${fmtTokens(m.output_tokens)} ${t('insights_output_tokens')}`;
-        return `<div class="insights-table-row"><span class="insights-model-name" title="${esc(m.model)}">${esc(m.model)}</span><span>${fmtNum(m.sessions)}</span><span class="insights-model-tokens" title="${esc(title)}">${fmtTokens(m.total_tokens || 0)}</span><span class="insights-model-cost">${fmtCost(m.cost)}</span><span>${share}%</span></div>`;
+        const cachePct = (m.cache_hit_percent === null || m.cache_hit_percent === undefined) ? null : Number(m.cache_hit_percent);
+        const cacheCell = cachePct === null
+          ? '<span class="insights-model-cache insights-model-cache-empty">—</span>'
+          : `<span class="insights-model-cache" title="${esc(t('insights_cache_hit'))}: ${fmtTokens(m.cache_read_tokens || 0)}">${cachePct}%</span>`;
+        return `<div class="insights-table-row"><span class="insights-model-name" title="${esc(m.model)}">${esc(m.model)}</span><span>${fmtNum(m.sessions)}</span><span class="insights-model-tokens" title="${esc(title)}">${fmtTokens(m.total_tokens || 0)}</span>${cacheCell}<span class="insights-model-cost">${fmtCost(m.cost)}</span><span>${share}%</span></div>`;
       }).join('') +
       `</div></div>`;
   } else {
@@ -8156,6 +8168,67 @@ function _extensionEntryBadge(entry){
   return `<span class="extension-status-badge ${cls}">${esc(_extensionEntryStatusLabel(entry))}</span>`;
 }
 
+function _configureExtensionSettingsFromStatus(data){
+  if(!window.HermesExtensionSettings||!data||!Array.isArray(data.extensions)) return;
+  window.HermesExtensionSettings.primeFromStatus({extensions:data.extensions});
+}
+
+function _extensionSettingsFieldHtml(field,value){
+  const key=String(field&&field.key||'');
+  const type=String(field&&field.type||'');
+  const label=String(field&&field.label||key);
+  const desc=String(field&&field.description||'');
+  const dataAttrs=`data-extension-setting-input="${esc(key)}" data-extension-setting-type="${esc(type)}"`;
+  let control='';
+  if(type==='boolean'){
+    control=`<label class="extension-setting-check"><input type="checkbox" ${dataAttrs}${value?' checked':''}> <span>${esc(label)}</span></label>`;
+  }else if(type==='number'||type==='integer'){
+    const step=type==='integer'?'1':'any';
+    control=`<label><span>${esc(label)}</span><input type="number" step="${step}" ${dataAttrs} value="${esc(String(value??''))}"></label>`;
+  }else if(type==='enum'){
+    const options=Array.isArray(field.options)?field.options:[];
+    control=`<label><span>${esc(label)}</span><select ${dataAttrs}>${options.map(option=>{
+      const optionValue=String(option&&option.value||'');
+      const optionLabel=String(option&&option.label||optionValue);
+      return `<option value="${esc(optionValue)}"${optionValue===value?' selected':''}>${esc(optionLabel)}</option>`;
+    }).join('')}</select></label>`;
+  }else{
+    control=`<label><span>${esc(label)}</span><input type="text" ${dataAttrs} value="${esc(String(value??''))}"></label>`;
+  }
+  return `<div class="extension-setting-field">${control}${desc?`<div class="extension-setting-desc">${esc(desc)}</div>`:''}</div>`;
+}
+
+function _extensionSettingsControls(entry){
+  const id=(entry&&entry.id)||'';
+  const storageOwned=!!(entry&&entry.storage_owned);
+  if(!storageOwned){
+    return '<div class="extension-settings-empty">No extension-owned browser storage permission.</div>';
+  }
+  const settingsApi=window.HermesExtensionSettings&&id?window.HermesExtensionSettings.settingsForExtension(id):null;
+  if(!settingsApi||!settingsApi.trusted){
+    return '<div class="extension-settings-empty">Reload WebUI after enabling or installing this extension to edit browser-local settings.</div>';
+  }
+  const schema=Array.isArray(settingsApi&&settingsApi.schema)?settingsApi.schema:[];
+  const values=settingsApi?settingsApi.values:{};
+  const fields=schema.length
+    ? schema.map(field=>_extensionSettingsFieldHtml(field,values[field.key])).join('')
+    : '<div class="extension-settings-empty">No configurable settings declared.</div>';
+  return `<div class="extension-settings-box">
+    <div class="extension-settings-head">
+      <div>
+        <div class="extension-settings-title">Browser-local extension settings</div>
+        <div class="extension-settings-note">Settings and extension-owned storage stay in this browser. Do not store secrets here.</div>
+      </div>
+    </div>
+    <div class="extension-settings-fields">${fields}</div>
+    <div class="extension-settings-actions">
+      <button class="sm-btn" type="button" data-extension-settings-save="${esc(id)}"${schema.length?'':' disabled aria-disabled="true"'}>Save settings</button>
+      <button class="sm-btn" type="button" data-extension-settings-reset="${esc(id)}"${schema.length?'':' disabled aria-disabled="true"'}>Reset settings</button>
+      <button class="sm-btn" type="button" data-extension-storage-clear="${esc(id)}">Clear extension storage</button>
+    </div>
+  </div>`;
+}
+
 function _extensionInstalledList(extensions,extensionDirConfigured){
   const list=Array.isArray(extensions)?extensions:[];
   if(!list.length){
@@ -8180,6 +8253,7 @@ function _extensionInstalledList(extensions,extensionDirConfigured){
           ${_extensionEntryBadge(entry)}
         </div>
         <div class="extension-installed-meta"><code>${esc(id)}</code><span>${esc(note)}</span></div>
+        ${_extensionSettingsControls(entry)}
       </div>
       <button class="sm-btn extension-toggle-btn" type="button" data-extension-toggle-id="${esc(id)}" data-extension-next-enabled="${nextEnabled}"${disabledAttr}>${esc(buttonText)}</button>
     </div>`;
@@ -8362,6 +8436,7 @@ function _renderExtensionsPanel(data,seq){
   const copyBtn=$('extensionsCopyDiagnosticsBtn');
   if(!target) return;
   _extensionsStatusData=data||null;
+  _configureExtensionSettingsFromStatus(data);
   if(copyBtn) copyBtn.disabled=!data;
   const manifest=(data&&data.manifest)||{};
   const counts=(data&&data.counts)||{};
@@ -8442,6 +8517,7 @@ function _renderExtensionsPanel(data,seq){
     </div>
   `;
   _bindExtensionToggleButtons(target);
+  _bindExtensionSettingsButtons(target);
   _monitorExtensionSidecars(sidecars,seq);
 }
 
@@ -8469,6 +8545,75 @@ async function handleExtensionToggle(btn){
     btn.textContent=previousText;
     showToast('Failed to update extension: '+(e&&e.message?e.message:String(e)));
   }
+}
+
+function _readExtensionSettingsForm(row){
+  const values={};
+  row.querySelectorAll('[data-extension-setting-input]').forEach(input=>{
+    const key=input.dataset.extensionSettingInput||'';
+    const type=input.dataset.extensionSettingType||'';
+    if(!key) return;
+    if(type==='boolean') values[key]=!!input.checked;
+    else if(type==='integer') values[key]=Number.parseInt(input.value,10);
+    else if(type==='number') values[key]=Number.parseFloat(input.value);
+    else values[key]=input.value;
+  });
+  return values;
+}
+
+function _fillExtensionSettingsForm(row,id){
+  if(!window.HermesExtensionSettings) return;
+  const values=window.HermesExtensionSettings.settingsForExtension(id).values;
+  row.querySelectorAll('[data-extension-setting-input]').forEach(input=>{
+    const key=input.dataset.extensionSettingInput||'';
+    const type=input.dataset.extensionSettingType||'';
+    const value=values[key];
+    if(type==='boolean') input.checked=!!value;
+    else input.value=value??'';
+  });
+}
+
+function _bindExtensionSettingsButtons(root){
+  if(!root) return;
+  root.querySelectorAll('[data-extension-settings-save]').forEach(btn=>{
+    btn.addEventListener('click',()=>handleExtensionSettingsSave(btn));
+  });
+  root.querySelectorAll('[data-extension-settings-reset]').forEach(btn=>{
+    btn.addEventListener('click',()=>handleExtensionSettingsReset(btn));
+  });
+  root.querySelectorAll('[data-extension-storage-clear]').forEach(btn=>{
+    btn.addEventListener('click',()=>handleExtensionStorageClear(btn));
+  });
+}
+
+function handleExtensionSettingsSave(btn){
+  const id=btn&&btn.dataset.extensionSettingsSave;
+  const row=btn&&btn.closest('[data-extension-id]');
+  if(!id||!row||!window.HermesExtensionSettings) return;
+  const api=window.HermesExtensionSettings.settingsForExtension(id);
+  const result=api.setAll(_readExtensionSettingsForm(row));
+  if(!result.ok){
+    showToast('Extension settings contain invalid values.');
+    return;
+  }
+  _fillExtensionSettingsForm(row,id);
+  showToast('Extension settings saved in this browser.');
+}
+
+function handleExtensionSettingsReset(btn){
+  const id=btn&&btn.dataset.extensionSettingsReset;
+  const row=btn&&btn.closest('[data-extension-id]');
+  if(!id||!row||!window.HermesExtensionSettings) return;
+  window.HermesExtensionSettings.settingsForExtension(id).reset();
+  _fillExtensionSettingsForm(row,id);
+  showToast('Extension settings reset in this browser.');
+}
+
+function handleExtensionStorageClear(btn){
+  const id=btn&&btn.dataset.extensionStorageClear;
+  if(!id||!window.HermesExtensionSettings) return;
+  window.HermesExtensionSettings.storageForExtension(id).clear();
+  showToast('Extension storage cleared in this browser.');
 }
 
 async function loadExtensionsPanel(opts){
@@ -8690,6 +8835,7 @@ async function loadExtensionsGallery(){
 function _renderExtensionsGallery(entries,statusData){
   const galleryEl=$('extensionsGallery');
   const installedEl=$('extensionsInstalled');
+  _configureExtensionSettingsFromStatus(statusData);
   const installedIds=new Set();
   if(statusData&&statusData.gallery_installed){
     Object.keys(statusData.gallery_installed).forEach(id=>installedIds.add(id));
@@ -8699,11 +8845,14 @@ function _renderExtensionsGallery(entries,statusData){
   }
   if(!Array.isArray(entries)||entries.length===0){
     if(galleryEl) galleryEl.innerHTML='<div class="extensions-empty">No extensions found in the registry.</div>';
-    if(installedEl) installedEl.innerHTML='<div class="extensions-empty">No extensions installed from the gallery.</div>';
+    if(installedEl){
+      installedEl.innerHTML=_extensionInstalledList(statusData&&statusData.extensions,!!(statusData&&statusData.extension_dir_configured));
+      _bindExtensionToggleButtons(installedEl);
+      _bindExtensionSettingsButtons(installedEl);
+    }
     return;
   }
   const galleryCards=[];
-  const installedCards=[];
   for(const entry of entries){
     const id=esc(String(entry.id||''));
     const name=esc(String(entry.name||entry.id||''));
@@ -8742,10 +8891,13 @@ function _renderExtensionsGallery(entries,statusData){
       <div class="extension-gallery-actions">${actionBtn}</div>
     </div>`;
     galleryCards.push(card);
-    if(isInstalled) installedCards.push(card);
   }
   if(galleryEl) galleryEl.innerHTML=galleryCards.length?galleryCards.join(''):'<div class="extensions-empty">No extensions found.</div>';
-  if(installedEl) installedEl.innerHTML=installedCards.length?installedCards.join(''):'<div class="extensions-empty">No extensions installed from the gallery.</div>';
+  if(installedEl){
+    installedEl.innerHTML=_extensionInstalledList(statusData&&statusData.extensions,!!(statusData&&statusData.extension_dir_configured));
+    _bindExtensionToggleButtons(installedEl);
+    _bindExtensionSettingsButtons(installedEl);
+  }
   _bindExtensionGalleryButtons(entries);
 }
 
